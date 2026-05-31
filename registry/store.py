@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -41,6 +42,66 @@ def _bool_to_int(value: Any) -> Optional[int]:
 
 def _load_schema() -> str:
     return SCHEMA_PATH.read_text(encoding="utf-8")
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug or "idea"
+
+
+def _normalize_known_lever_status(raw_status: str) -> str:
+    lowered = raw_status.lower()
+    if "have" in lowered:
+        return "have"
+    if "open" in lowered:
+        return "open"
+    if "partial" in lowered or "untuned" in lowered:
+        return "partial"
+    if "alt" in lowered:
+        return "alt"
+    if "speculative" in lowered:
+        return "speculative"
+    return "open"
+
+
+def _clean_markdown_cell(text: str) -> str:
+    return re.sub(r"[*_`]", "", text).strip()
+
+
+def _parse_known_lever_rows(markdown_path: Path) -> list[dict]:
+    rows: list[dict] = []
+    section = None
+    table_re = re.compile(r"^\|\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$")
+    for raw_line in markdown_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("### "):
+            section = line[4:].strip()
+            continue
+        match = table_re.match(line)
+        if not match:
+            continue
+        try:
+            row_num = int(match.group(1))
+        except ValueError:
+            continue
+        lever = _clean_markdown_cell(match.group(2))
+        what_it_is = _clean_markdown_cell(match.group(3))
+        status = match.group(4).strip()
+        notes = _clean_markdown_cell(match.group(5))
+        if lever == "Lever":
+            continue
+        rows.append(
+            {
+                "row_num": row_num,
+                "section": section,
+                "lever": lever,
+                "what_it_is": what_it_is,
+                "status": _normalize_known_lever_status(status),
+                "raw_status": status,
+                "notes": notes,
+            }
+        )
+    return rows
 
 
 @dataclass
@@ -438,8 +499,63 @@ class ExperimentRegistry:
         proposed_by: Optional[str] = None,
         idea_id: Optional[str] = None,
     ) -> str:
-        idea_id = idea_id or new_id()
+        return self.upsert_idea(
+            idea_id or new_id(),
+            title,
+            summary=summary,
+            explanation=explanation,
+            confidence=confidence,
+            expected_gain=expected_gain,
+            pros=pros,
+            cons=cons,
+            outcome=outcome,
+            reference_url=reference_url,
+            thread_name=thread_name,
+            hypothesis=hypothesis,
+            lever=lever,
+            rationale=rationale,
+            expected_effect=expected_effect,
+            scale_target=scale_target,
+            command=command,
+            gpu_class=gpu_class,
+            estimated_minutes=estimated_minutes,
+            priority=priority,
+            status=status,
+            proposed_by=proposed_by,
+            preserve_existing=False,
+        )
+
+    def upsert_idea(
+        self,
+        idea_id: str,
+        title: str,
+        *,
+        summary: Optional[str] = None,
+        explanation: Optional[str] = None,
+        confidence: Optional[str] = None,
+        expected_gain: Optional[str] = None,
+        pros: Optional[str] = None,
+        cons: Optional[str] = None,
+        outcome: Optional[str] = None,
+        reference_url: Optional[str] = None,
+        thread_name: Optional[str] = None,
+        hypothesis: Optional[str] = None,
+        lever: Optional[str] = None,
+        rationale: Optional[str] = None,
+        expected_effect: Optional[str] = None,
+        scale_target: Optional[str] = None,
+        command: Optional[str] = None,
+        gpu_class: Optional[str] = None,
+        estimated_minutes: Optional[float] = None,
+        priority: int = 0,
+        status: str = "proposed",
+        proposed_by: Optional[str] = None,
+        preserve_existing: bool = True,
+    ) -> str:
         now = utc_now()
+        row = self.conn.execute("SELECT created_at FROM ideas WHERE id = ?", (idea_id,)).fetchone()
+        created_at = row["created_at"] if row else now
+        current = self.get_idea(idea_id) if row else None
         self.conn.execute(
             """
             INSERT INTO ideas (
@@ -448,15 +564,103 @@ class ExperimentRegistry:
                 command, gpu_class, estimated_minutes, priority, status, proposed_by,
                 reviewed_by, review_note, reviewed_at, queue_item_id, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
-            """,
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                summary = excluded.summary,
+                explanation = excluded.explanation,
+                confidence = excluded.confidence,
+                expected_gain = excluded.expected_gain,
+                pros = excluded.pros,
+                cons = excluded.cons,
+                outcome = excluded.outcome,
+                reference_url = excluded.reference_url,
+                thread_name = excluded.thread_name,
+                hypothesis = excluded.hypothesis,
+                lever = excluded.lever,
+                rationale = excluded.rationale,
+                expected_effect = excluded.expected_effect,
+                scale_target = excluded.scale_target,
+                command = excluded.command,
+                gpu_class = excluded.gpu_class,
+                estimated_minutes = excluded.estimated_minutes,
+                priority = excluded.priority,
+                proposed_by = excluded.proposed_by,
+                updated_at = excluded.updated_at
+                {status_clause}
+            """.format(
+                status_clause="" if preserve_existing else ", status = excluded.status",
+            ),
             (
-                idea_id, title, summary, explanation, confidence, expected_gain, pros, cons, outcome, reference_url,
-                thread_name, hypothesis, lever, rationale, expected_effect, scale_target,
-                command, gpu_class, estimated_minutes, priority, status, proposed_by, now, now,
+                idea_id,
+                title,
+                summary,
+                explanation,
+                confidence,
+                expected_gain,
+                pros,
+                cons,
+                outcome,
+                reference_url,
+                thread_name,
+                hypothesis,
+                lever,
+                rationale,
+                expected_effect,
+                scale_target,
+                command,
+                gpu_class,
+                estimated_minutes,
+                priority,
+                status,
+                proposed_by,
+                created_at,
+                now,
             ),
         )
         self.conn.commit()
         return idea_id
+
+    def import_known_levers(
+        self,
+        markdown_path: Path,
+        *,
+        thread_name: str = "recipe",
+    ) -> int:
+        imported = 0
+        existing_thread = self.conn.execute(
+            "SELECT name FROM threads WHERE name = ?",
+            (thread_name,),
+        ).fetchone()
+        if not existing_thread:
+            self.upsert_thread(
+                thread_name,
+                hypothesis="Known levers backlog imported from docs/KNOWN_LEVERS.md",
+                status="active",
+                priority=1,
+                notes_path=str(markdown_path),
+            )
+        for row in _parse_known_lever_rows(markdown_path):
+            lever_title = row["lever"]
+            idea_id = f"known-lever-{row['row_num']:02d}-{_slugify(lever_title)}"
+            priority = 0 if "value residual" in lever_title.lower() else row["row_num"]
+            explanation = f"Section: {row['section']}\nNotes: {row['notes']}" if row["section"] else row["notes"]
+            self.upsert_idea(
+                idea_id,
+                lever_title,
+                summary=row["what_it_is"],
+                explanation=explanation,
+                outcome=row["raw_status"],
+                reference_url=str(markdown_path),
+                thread_name=thread_name,
+                lever=lever_title,
+                rationale=row["notes"],
+                priority=priority,
+                status=row["status"],
+                proposed_by="docs/KNOWN_LEVERS.md",
+                preserve_existing=True,
+            )
+            imported += 1
+        return imported
 
     def list_ideas(self, status: Optional[str] = None) -> list:
         if status:
@@ -495,6 +699,26 @@ class ExperimentRegistry:
         )
         self.conn.commit()
         return status
+
+    def approve_and_promote_idea(
+        self,
+        idea_id: str,
+        *,
+        reviewed_by: Optional[str] = None,
+        review_note: Optional[str] = None,
+        created_by: str = "registry",
+    ) -> str:
+        self.review_idea(
+            idea_id,
+            decision="approve",
+            reviewed_by=reviewed_by,
+            review_note=review_note,
+        )
+        return self.promote_idea_to_queue(
+            idea_id,
+            created_by=created_by,
+            require_approved=True,
+        )
 
     def promote_idea_to_queue(
         self,

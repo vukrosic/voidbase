@@ -5,6 +5,8 @@ from pathlib import Path
 
 import streamlit as st
 
+from registry.store import open_registry
+
 DB = Path(__file__).parent / "experiments.sqlite"
 
 
@@ -18,13 +20,31 @@ def utc_now():
 
 def review_idea(idea_id, status, reviewed_by="human", note=None):
     """Write-mode: approve/reject an idea straight from the browser."""
-    conn = get_db()
-    conn.execute(
-        "UPDATE ideas SET status=?, reviewed_by=?, review_note=?, reviewed_at=?, updated_at=? WHERE id=?",
-        (status, reviewed_by, note, utc_now(), utc_now(), idea_id),
-    )
-    conn.commit()
-    conn.close()
+    with open_registry(DB) as registry:
+        registry.review_idea(
+            idea_id,
+            decision="approve" if status == "approved" else "reject" if status == "rejected" else status,
+            reviewed_by=reviewed_by,
+            review_note=note,
+        )
+
+
+def approve_and_promote_idea(idea_id, reviewed_by="human", note=None):
+    with open_registry(DB) as registry:
+        registry.approve_and_promote_idea(
+            idea_id,
+            reviewed_by=reviewed_by,
+            review_note=note,
+            created_by="dashboard",
+        )
+
+
+def promote_idea(idea_id):
+    with open_registry(DB) as registry:
+        registry.promote_idea_to_queue(
+            idea_id,
+            created_by="dashboard",
+        )
 
 
 def make_link(path):
@@ -61,7 +81,9 @@ def main():
     avg_delta = cur.fetchone()[0] or 0
     cur.execute("SELECT COUNT(*) FROM threads")
     total_threads = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM ideas WHERE status = 'proposed'")
+    cur.execute(
+        "SELECT COUNT(*) FROM ideas WHERE status IN ('proposed', 'open', 'partial', 'alt', 'speculative')"
+    )
     pending = cur.fetchone()[0]
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -86,9 +108,27 @@ def main():
         cur.execute("SELECT status, COUNT(*) FROM ideas GROUP BY status")
         _counts = {s: n for s, n in cur.fetchall()}
         _counts["all"] = sum(_counts.values())
+        preferred = [
+            "open",
+            "proposed",
+            "partial",
+            "alt",
+            "have",
+            "approved",
+            "queued",
+            "rejected",
+            "speculative",
+            "done",
+        ]
+        dynamic_statuses = [s for s in preferred if s in _counts]
+        dynamic_statuses.extend(
+            s for s in sorted(_counts) if s not in dynamic_statuses and s != "all"
+        )
         status_filter = st.radio(
-            "Show", ["proposed", "approved", "rejected", "queued", "all"],
-            horizontal=True, index=0,
+            "Show",
+            ["all"] + dynamic_statuses,
+            horizontal=True,
+            index=1 if dynamic_statuses else 0,
             format_func=lambda s: f"{s} ({_counts.get(s, 0)})",
         )
         if status_filter == "all":
@@ -105,8 +145,18 @@ def main():
             # color the row dot by confidence so green/yellow/red is visible while collapsed
             badge = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(
                 conf_row,
-                {"proposed": "🟡", "approved": "🟢", "rejected": "🔴",
-                 "queued": "🔵", "done": "⚪"}.get(idea["status"], ""))
+                {
+                    "proposed": "🟡",
+                    "open": "🟡",
+                    "partial": "🟠",
+                    "alt": "🟠",
+                    "have": "⚪",
+                    "approved": "🟢",
+                    "rejected": "🔴",
+                    "queued": "🔵",
+                    "done": "⚪",
+                    "speculative": "🟣",
+                }.get(idea["status"], ""))
             tag = f" · {conf_row}" if conf_row else ""
             gain_row = idea.get("expected_gain") or ""
             gain_tag = f" · {gain_row.split('(')[0].strip()}" if gain_row else ""
@@ -151,18 +201,30 @@ def main():
                     st.code(idea["command"], language="bash")
                 if idea.get("review_note"):
                     st.markdown(f"_Review note: {idea['review_note']}_")
-                if idea["status"] == "proposed":
+                actionable = idea["status"] in {"proposed", "open", "partial", "alt", "speculative"}
+                if actionable:
                     note = st.text_input("Review note (optional)", key=f"note_{idea['id']}")
-                    c1, c2 = st.columns(2)
+                    if idea.get("command"):
+                        c1, c2, c3 = st.columns(3)
+                    else:
+                        c1, c2 = st.columns(2)
                     if c1.button("✅ Approve", key=f"app_{idea['id']}"):
                         review_idea(idea["id"], "approved", note=note or None)
                         st.rerun()
                     if c2.button("❌ Reject", key=f"rej_{idea['id']}"):
                         review_idea(idea["id"], "rejected", note=note or None)
                         st.rerun()
+                    if idea.get("command"):
+                        if c3.button("🚀 Approve + queue", key=f"appq_{idea['id']}"):
+                            approve_and_promote_idea(idea["id"], note=note or None)
+                            st.rerun()
                 elif idea["status"] == "approved":
-                    st.success("Approved. Promote to queue via CLI: "
-                               f"`python scripts/experiment_registry.py idea promote --id {idea['id']}`")
+                    if idea.get("command"):
+                        if st.button("🚀 Promote to queue", key=f"prom_{idea['id']}"):
+                            promote_idea(idea["id"])
+                            st.rerun()
+                    else:
+                        st.success("Approved in DB. Add a runnable command to promote it to the queue.")
 
     # ── Negatives (ran-and-lost) ───────────────────────────────────────────────
     with tab_negatives:

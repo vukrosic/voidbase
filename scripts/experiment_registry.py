@@ -155,6 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
     idea_reject.add_argument("--reviewed-by", default="human")
     idea_reject.add_argument("--note")
 
+    idea_import = idea_sub.add_parser(
+        "import-known-levers",
+        help="Import docs/KNOWN_LEVERS.md-style lever rows into the ideas table",
+    )
+    idea_import.add_argument("--path", required=True, type=Path)
+    idea_import.add_argument("--thread-name", default="recipe")
+
     idea_promote = idea_sub.add_parser("promote", help="Turn an approved idea into a queue item")
     idea_promote.add_argument("--id", required=True)
     idea_promote.add_argument("--created-by", default="registry")
@@ -314,6 +321,13 @@ def main() -> int:
                     review_note=args.note,
                 )
                 print(json.dumps({"idea_id": args.id, "status": status}, indent=2))
+                return 0
+            if args.idea_command == "import-known-levers":
+                imported = registry.import_known_levers(
+                    args.path,
+                    thread_name=args.thread_name,
+                )
+                print(json.dumps({"path": str(args.path), "imported": imported}, indent=2))
                 return 0
             if args.idea_command == "promote":
                 queue_id = registry.promote_idea_to_queue(args.id, created_by=args.created_by)
