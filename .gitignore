@@ -1,0 +1,10 @@
+# Live experiment data — stays local, never committed
+registry/*.sqlite
+registry/*.sqlite-shm
+registry/*.sqlite-wal
+registry/*.sqlite-journal
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
