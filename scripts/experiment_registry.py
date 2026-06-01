@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +14,161 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from registry.store import DEFAULT_DB_PATH, open_registry
+
+
+def _is_idle(pattern: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["bash", "-lc", f"pgrep -af {shlex.quote(pattern)} || true"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return True
+    keep = [
+        line
+        for line in proc.stdout.splitlines()
+        if pattern in line
+        and "pgrep -af" not in line
+        and "experiment_registry.py" not in line
+    ]
+    return len(keep) == 0
+
+
+def _wait_for_idle(pattern: str, poll_seconds: int, label: str) -> None:
+    while not _is_idle(pattern):
+        print(f"[queue] waiting for {pattern!r} to be idle before {label}...", file=sys.stderr)
+        time.sleep(poll_seconds)
+
+
+def _run_subprocess(
+    cmd: str,
+    log_path: Path,
+    cwd: Path,
+) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[queue] $ {cmd}")
+    print(f"[queue]   cwd={cwd}")
+    print(f"[queue]   log={log_path}")
+    with log_path.open("a") as log_f:
+        log_f.write(f"\n### START {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
+        log_f.write(f"### CMD: {cmd}\n")
+        log_f.write(f"### CWD: {cwd}\n")
+        log_f.flush()
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=str(cwd),
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            executable="/bin/bash",
+        )
+        rc = proc.wait()
+        log_f.write(f"\n### END rc={rc}\n")
+    return rc
+
+
+def _select_queue_items(
+    registry,
+    *,
+    thread_name: str | None,
+    name: str | None,
+    status_filter: str,
+) -> list:
+    sql = "SELECT * FROM queue_items WHERE status = ?"
+    params: list = [status_filter]
+    if thread_name:
+        sql += " AND thread_name = ?"
+        params.append(thread_name)
+    if name:
+        sql += " AND name = ?"
+        params.append(name)
+    sql += " ORDER BY priority DESC, created_at"
+    rows = registry.conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _await_decision(registry, *, thread_name: str, poll_seconds: int) -> None:
+    """Block until a decision row appears for this thread since we last looked."""
+    marker = time.time()
+    print(f"[queue] pause-for-decision: waiting for a `decision` row on thread={thread_name!r}")
+    while True:
+        row = registry.conn.execute(
+            """
+            SELECT id, decision, reason, decided_by, decided_at
+            FROM decisions
+            WHERE thread_name = ? AND decided_at >= ?
+            ORDER BY decided_at DESC LIMIT 1
+            """,
+            (thread_name, _iso_from_epoch(marker)),
+        ).fetchone()
+        if row:
+            print(
+                f"[queue] decision received: {row['decision']} "
+                f"(by={row['decided_by']}, reason={row['reason']})"
+            )
+            return
+        time.sleep(poll_seconds)
+
+
+def _iso_from_epoch(epoch_seconds: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def run_queue_from_db(
+    registry,
+    *,
+    thread_name: str | None,
+    name: str | None,
+    status_filter: str,
+    wait_for_idle: bool,
+    idle_pattern: str,
+    poll_seconds: int,
+    stop_on_failure: bool,
+    pause_for_decision: bool,
+) -> None:
+    items = _select_queue_items(
+        registry,
+        thread_name=thread_name,
+        name=name,
+        status_filter=status_filter,
+    )
+    if not items:
+        print(f"[queue] no queue items with status={status_filter!r} (filter: thread={thread_name}, name={name})")
+        return
+    print(f"[queue] picked up {len(items)} item(s)")
+    for item in items:
+        item_id = item["id"]
+        item_name = item["name"]
+        item_thread = item["thread_name"]
+        cmd = item["command"]
+        log_path = Path(item["log_path"]) if item["log_path"] else Path(f"logs/queue/{item_thread}__{item_name}.log")
+        cwd = Path(ROOT)
+        if wait_for_idle:
+            _wait_for_idle(idle_pattern, poll_seconds, label=item_name)
+        registry.update_queue_item_status(
+            item_thread,
+            item_name,
+            status="running",
+            started_at=registry.conn.execute("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')").fetchone()[0],
+        )
+        rc = _run_subprocess(cmd, log_path, cwd)
+        finished_at = registry.conn.execute("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')").fetchone()[0]
+        registry.update_queue_item_status(
+            item_thread,
+            item_name,
+            status="done" if rc == 0 else "failed",
+            finished_at=finished_at,
+        )
+        print(f"[queue] {item_thread}/{item_name} -> rc={rc}")
+        if rc != 0 and stop_on_failure:
+            print("[queue] stop-on-failure: aborting")
+            return
+        if pause_for_decision:
+            _await_decision(registry, thread_name=item_thread, poll_seconds=poll_seconds)
+    print("[queue] done")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,7 +187,6 @@ def build_parser() -> argparse.ArgumentParser:
     thread_upsert = thread_sub.add_parser("upsert", help="Insert or update a thread")
     thread_upsert.add_argument("--name", required=True)
     thread_upsert.add_argument("--hypothesis")
-    thread_upsert.add_argument("--owner")
     thread_upsert.add_argument("--status", default="active")
     thread_upsert.add_argument("--priority", type=int, default=0)
     thread_upsert.add_argument("--notes-path")
@@ -43,13 +200,39 @@ def build_parser() -> argparse.ArgumentParser:
     queue_upsert.add_argument("--command", required=True)
     queue_upsert.add_argument("--status", default="planned")
     queue_upsert.add_argument("--priority", type=int, default=0)
-    queue_upsert.add_argument("--depends-on")
     queue_upsert.add_argument("--gpu-class")
-    queue_upsert.add_argument("--estimated-minutes", type=float)
-    queue_upsert.add_argument("--created-by")
     queue_upsert.add_argument("--log-path")
     queue_upsert.add_argument("--output-dir")
     queue_upsert.add_argument("--decision")
+
+    queue_run = queue_sub.add_parser(
+        "run",
+        help="Execute queued items from the DB, updating status as we go",
+    )
+    queue_run.add_argument("--thread-name", help="Restrict to a single thread")
+    queue_run.add_argument("--name", help="Run a single queue item by name (requires --thread-name)")
+    queue_run.add_argument(
+        "--status-filter",
+        default="queued",
+        help="Status of items to pick up (default: queued)",
+    )
+    queue_run.add_argument(
+        "--wait-for-idle",
+        action="store_true",
+        help="Wait until no train_llm.py is running before each job",
+    )
+    queue_run.add_argument("--idle-pattern", default="train_llm.py")
+    queue_run.add_argument("--poll-seconds", type=int, default=30)
+    queue_run.add_argument(
+        "--stop-on-failure",
+        action="store_true",
+        default=True,
+    )
+    queue_run.add_argument(
+        "--pause-for-decision",
+        action="store_true",
+        help="After each job, wait for a `decision` row in the DB before continuing",
+    )
 
     run = subparsers.add_parser("run", help="Manage run records")
     run_sub = run.add_subparsers(dest="run_command", required=True)
@@ -59,8 +242,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_start.add_argument("--command")
     run_start.add_argument("--status", default="running")
     run_start.add_argument("--queue-item-id")
-    run_start.add_argument("--commit")
-    run_start.add_argument("--branch")
     run_start.add_argument("--config")
     run_start.add_argument("--seed", type=int)
     run_start.add_argument("--tokens-target", type=int)
@@ -118,42 +299,23 @@ def build_parser() -> argparse.ArgumentParser:
     decision.add_argument("--reason")
     decision.add_argument("--decided-by")
 
-    idea = subparsers.add_parser("idea", help="Propose / approve / promote experiment ideas")
+    idea = subparsers.add_parser("idea", help="Track experiment ideas (title + description)")
     idea_sub = idea.add_subparsers(dest="idea_command", required=True)
 
-    idea_add = idea_sub.add_parser("add", help="Propose a new experiment idea (status=proposed)")
+    idea_add = idea_sub.add_parser("add", help="Add an idea (status=proposed)")
     idea_add.add_argument("--title", required=True)
-    idea_add.add_argument("--summary", help="One-sentence summary shown on top")
     idea_add.add_argument("--explanation", help="Step-by-step plain-English walkthrough")
-    idea_add.add_argument("--confidence", help="high|medium|low — confidence it lowers val loss")
-    idea_add.add_argument("--expected-gain", help="Estimated val-loss change at 200M, e.g. '-0.02 to -0.05'")
-    idea_add.add_argument("--pros", help="Pros, one per line (use \\n)")
-    idea_add.add_argument("--cons", help="Cons, one per line (use \\n)")
-    idea_add.add_argument("--reference-url", help="Source URL (paper/PR/blog) if any")
-    idea_add.add_argument("--thread-name")
-    idea_add.add_argument("--hypothesis")
-    idea_add.add_argument("--lever", help="The one thing that changes")
-    idea_add.add_argument("--rationale")
-    idea_add.add_argument("--expected-effect")
-    idea_add.add_argument("--scale-target", help="e.g. '5M screen -> 200M full if win'")
-    idea_add.add_argument("--command", help="Ready-to-run command (needed to promote)")
-    idea_add.add_argument("--gpu-class")
-    idea_add.add_argument("--estimated-minutes", type=float)
-    idea_add.add_argument("--priority", type=int, default=0)
-    idea_add.add_argument("--proposed-by", default="ai")
+    idea_add.add_argument("--status", default="proposed")
 
     idea_list = idea_sub.add_parser("list", help="List ideas (optionally by status)")
-    idea_list.add_argument("--status", help="proposed|approved|rejected|queued|done")
+    idea_list.add_argument("--status", help="proposed|open|rejected|scaled|...")
 
-    idea_approve = idea_sub.add_parser("approve", help="Approve a proposed idea")
-    idea_approve.add_argument("--id", required=True)
-    idea_approve.add_argument("--reviewed-by", default="human")
-    idea_approve.add_argument("--note")
+    idea_delete = idea_sub.add_parser("delete", help="Permanently delete an idea")
+    idea_delete.add_argument("--id", required=True)
 
-    idea_reject = idea_sub.add_parser("reject", help="Reject a proposed idea")
-    idea_reject.add_argument("--id", required=True)
-    idea_reject.add_argument("--reviewed-by", default="human")
-    idea_reject.add_argument("--note")
+    idea_notes = idea_sub.add_parser("set-notes", help="Set freeform notes for an idea")
+    idea_notes.add_argument("--id", required=True)
+    idea_notes.add_argument("--notes", required=True)
 
     idea_import = idea_sub.add_parser(
         "import-known-levers",
@@ -161,10 +323,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     idea_import.add_argument("--path", required=True, type=Path)
     idea_import.add_argument("--thread-name", default="recipe")
-
-    idea_promote = idea_sub.add_parser("promote", help="Turn an approved idea into a queue item")
-    idea_promote.add_argument("--id", required=True)
-    idea_promote.add_argument("--created-by", default="registry")
 
     subparsers.add_parser("summary", help="Print table counts and status breakdowns")
     return parser
@@ -184,7 +342,6 @@ def main() -> int:
                 registry.upsert_thread(
                     args.name,
                     hypothesis=args.hypothesis,
-                    owner=args.owner,
                     status=args.status,
                     priority=args.priority,
                     notes_path=args.notes_path,
@@ -200,15 +357,25 @@ def main() -> int:
                     args.command,
                     status=args.status,
                     priority=args.priority,
-                    depends_on=args.depends_on,
                     gpu_class=args.gpu_class,
-                    estimated_minutes=args.estimated_minutes,
-                    created_by=args.created_by,
                     log_path=args.log_path,
                     output_dir=args.output_dir,
                     decision=args.decision,
                 )
                 print(json.dumps({"queue_item_id": queue_id, "status": args.status}, indent=2))
+                return 0
+            if args.queue_command == "run":
+                run_queue_from_db(
+                    registry,
+                    thread_name=args.thread_name,
+                    name=args.name,
+                    status_filter=args.status_filter,
+                    wait_for_idle=args.wait_for_idle,
+                    idle_pattern=args.idle_pattern,
+                    poll_seconds=args.poll_seconds,
+                    stop_on_failure=args.stop_on_failure,
+                    pause_for_decision=args.pause_for_decision,
+                )
                 return 0
         if args.action == "run":
             if args.run_command == "start":
@@ -218,8 +385,6 @@ def main() -> int:
                     status=args.status,
                     queue_item_id=args.queue_item_id,
                     command=args.command,
-                    code_commit=args.commit,
-                    branch=args.branch,
                     config=args.config,
                     seed=args.seed,
                     tokens_target=args.tokens_target,
@@ -283,44 +448,27 @@ def main() -> int:
             if args.idea_command == "add":
                 idea_id = registry.add_idea(
                     args.title,
-                    summary=args.summary,
                     explanation=args.explanation,
-                    confidence=args.confidence,
-                    expected_gain=args.expected_gain,
-                    pros=args.pros,
-                    cons=args.cons,
-                    reference_url=args.reference_url,
-                    thread_name=args.thread_name,
-                    hypothesis=args.hypothesis,
-                    lever=args.lever,
-                    rationale=args.rationale,
-                    expected_effect=args.expected_effect,
-                    scale_target=args.scale_target,
-                    command=args.command,
-                    gpu_class=args.gpu_class,
-                    estimated_minutes=args.estimated_minutes,
-                    priority=args.priority,
-                    proposed_by=args.proposed_by,
+                    status=args.status,
                 )
-                print(json.dumps({"idea_id": idea_id, "status": "proposed"}, indent=2))
+                print(json.dumps({"idea_id": idea_id, "status": args.status}, indent=2))
                 return 0
             if args.idea_command == "list":
                 ideas = registry.list_ideas(status=args.status)
                 for i in ideas:
                     print(json.dumps(
-                        {k: i[k] for k in ("id", "status", "priority", "title", "thread_name", "scale_target")},
+                        {k: i[k] for k in ("id", "status", "title")},
                         indent=2,
                     ))
                 print(f"\n{len(ideas)} idea(s)")
                 return 0
-            if args.idea_command in ("approve", "reject"):
-                status = registry.review_idea(
-                    args.id,
-                    decision=args.idea_command,
-                    reviewed_by=args.reviewed_by,
-                    review_note=args.note,
-                )
-                print(json.dumps({"idea_id": args.id, "status": status}, indent=2))
+            if args.idea_command == "delete":
+                deleted = registry.delete_idea(args.id)
+                print(json.dumps({"idea_id": args.id, "deleted": deleted}, indent=2))
+                return 0
+            if args.idea_command == "set-notes":
+                notes = registry.set_idea_notes(args.id, args.notes)
+                print(json.dumps({"idea_id": args.id, "notes": notes}, indent=2))
                 return 0
             if args.idea_command == "import-known-levers":
                 imported = registry.import_known_levers(
@@ -328,10 +476,6 @@ def main() -> int:
                     thread_name=args.thread_name,
                 )
                 print(json.dumps({"path": str(args.path), "imported": imported}, indent=2))
-                return 0
-            if args.idea_command == "promote":
-                queue_id = registry.promote_idea_to_queue(args.id, created_by=args.created_by)
-                print(json.dumps({"idea_id": args.id, "queue_item_id": queue_id, "status": "queued"}, indent=2))
                 return 0
         if args.action == "decision":
             decision_id = registry.record_decision(

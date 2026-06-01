@@ -1,13 +1,51 @@
 """Registry dashboard. Read-only views + an Ideas approval gate (write)."""
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from registry.store import open_registry
 
 DB = Path(__file__).parent / "experiments.sqlite"
+
+
+def _copy_button(idea_id: str, title: str, key: str) -> None:
+    """One-click copy of `id\\ntitle` to the clipboard. Shows a 1.5s 'Copied!' flash."""
+    copy_text = json.dumps(f"id: {idea_id}\ntitle: {title}")
+    components.html(
+        f"""
+<div style="display:flex;align-items:center;gap:8px;font-family:inherit;">
+  <button id="btn_{key}" style="background:#ffffff;color:#111827;border:1px solid #d0d0d0;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:14px;line-height:1.4;">
+    📋 Copy
+  </button>
+  <span id="msg_{key}" style="color:#16a34a;font-size:13px;opacity:0;transition:opacity .2s;">✓ Copied!</span>
+</div>
+<script>
+  (function() {{
+    const btn = document.getElementById("btn_{key}");
+    const msg = document.getElementById("msg_{key}");
+    btn.addEventListener("click", async () => {{
+      try {{
+        await navigator.clipboard.writeText({copy_text});
+        msg.textContent = "✓ Copied!";
+        msg.style.color = "#16a34a";
+        msg.style.opacity = "1";
+        setTimeout(() => {{ msg.style.opacity = "0"; }}, 1500);
+      }} catch (e) {{
+        msg.textContent = "✗ Copy blocked";
+        msg.style.color = "#dc2626";
+        msg.style.opacity = "1";
+        setTimeout(() => {{ msg.style.opacity = "0"; }}, 2000);
+      }}
+    }});
+  }})();
+</script>
+""",
+        height=40,
+    )
 
 
 def get_db():
@@ -18,33 +56,16 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def review_idea(idea_id, status, reviewed_by="human", note=None):
-    """Write-mode: approve/reject an idea straight from the browser."""
+def delete_idea(idea_id):
+    """Write-mode: permanently delete an idea from the DB."""
     with open_registry(DB) as registry:
-        registry.review_idea(
-            idea_id,
-            decision="approve" if status == "approved" else "reject" if status == "rejected" else status,
-            reviewed_by=reviewed_by,
-            review_note=note,
-        )
+        registry.delete_idea(idea_id)
 
 
-def approve_and_promote_idea(idea_id, reviewed_by="human", note=None):
+def set_idea_notes(idea_id, notes):
+    """Write-mode: persist freeform notes for an idea."""
     with open_registry(DB) as registry:
-        registry.approve_and_promote_idea(
-            idea_id,
-            reviewed_by=reviewed_by,
-            review_note=note,
-            created_by="dashboard",
-        )
-
-
-def promote_idea(idea_id):
-    with open_registry(DB) as registry:
-        registry.promote_idea_to_queue(
-            idea_id,
-            created_by="dashboard",
-        )
+        registry.set_idea_notes(idea_id, notes)
 
 
 def make_link(path):
@@ -128,122 +149,68 @@ def main():
             "Show",
             ["all"] + dynamic_statuses,
             horizontal=True,
-            index=1 if dynamic_statuses else 0,
+            index=(["all"] + dynamic_statuses).index("proposed") if "proposed" in dynamic_statuses else (1 if dynamic_statuses else 0),
             format_func=lambda s: f"{s} ({_counts.get(s, 0)})",
         )
         if status_filter == "all":
-            cur.execute("SELECT * FROM ideas ORDER BY priority, created_at")
+            cur.execute("SELECT * FROM ideas ORDER BY created_at")
         else:
-            cur.execute("SELECT * FROM ideas WHERE status=? ORDER BY priority, created_at", (status_filter,))
+            cur.execute("SELECT * FROM ideas WHERE status=? ORDER BY created_at", (status_filter,))
         cols = [d[0] for d in cur.description]
         ideas = [dict(zip(cols, row)) for row in cur.fetchall()]
 
         if not ideas:
             st.info(f"No ideas with status '{status_filter}'.")
         for idea in ideas:
-            conf_row = (idea.get("confidence") or "").lower()
-            # color the row dot by confidence so green/yellow/red is visible while collapsed
-            badge = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(
-                conf_row,
-                {
-                    "proposed": "🟡",
-                    "open": "🟡",
-                    "partial": "🟠",
-                    "alt": "🟠",
-                    "have": "⚪",
-                    "approved": "🟢",
-                    "rejected": "🔴",
-                    "queued": "🔵",
-                    "done": "⚪",
-                    "speculative": "🟣",
-                }.get(idea["status"], ""))
-            tag = f" · {conf_row}" if conf_row else ""
-            gain_row = idea.get("expected_gain") or ""
-            gain_tag = f" · {gain_row.split('(')[0].strip()}" if gain_row else ""
-            with st.expander(f"{badge} {idea['title']}{tag}{gain_tag}  ·  p{idea['priority']}"):
-                if idea.get("summary"):
-                    st.markdown(f"### {idea['summary']}")
-                conf = (idea.get("confidence") or "").lower()
-                if conf:
-                    dot = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(conf, "⚪")
-                    gain = idea.get("expected_gain") or "?"
-                    st.markdown(f"**My call:** {dot} **{conf.upper()}** confidence · "
-                                f"est. val-loss change at 200M: **{gain}**")
-                if idea.get("reference_url"):
-                    st.markdown(f"🔗 [{idea['reference_url']}]({idea['reference_url']})")
+            with st.expander(idea['title'], expanded=True):
                 if idea.get("explanation"):
-                    st.markdown("**How it works:**")
+                    st.markdown("**How it works**")
                     st.markdown(idea["explanation"])
-                if idea.get("pros") or idea.get("cons"):
-                    pc1, pc2 = st.columns(2)
-                    with pc1:
-                        st.markdown("**✅ Pros**")
-                        for line in (idea.get("pros") or "—").split("\n"):
-                            st.markdown(f"- {line}" if not line.startswith("-") else line)
-                    with pc2:
-                        st.markdown("**⚠️ Cons**")
-                        for line in (idea.get("cons") or "—").split("\n"):
-                            st.markdown(f"- {line}" if not line.startswith("-") else line)
-                st.markdown(f"**Thread:** {idea.get('thread_name') or '—'}  ·  "
-                            f"**Est:** {idea.get('estimated_minutes') or '?'} min  ·  "
-                            f"**GPU:** {idea.get('gpu_class') or '—'}")
-                if idea.get("hypothesis"):
-                    st.markdown(f"**Hypothesis:** {idea['hypothesis']}")
-                if idea.get("lever"):
-                    st.markdown(f"**Lever:** {idea['lever']}")
-                if idea.get("rationale"):
-                    st.markdown(f"**Rationale:** {idea['rationale']}")
-                if idea.get("expected_effect"):
-                    st.markdown(f"**Expected:** {idea['expected_effect']}")
-                if idea.get("scale_target"):
-                    st.markdown(f"**Scale target:** {idea['scale_target']}")
-                if idea.get("command"):
-                    st.code(idea["command"], language="bash")
-                if idea.get("review_note"):
-                    st.markdown(f"_Review note: {idea['review_note']}_")
-                actionable = idea["status"] in {"proposed", "open", "partial", "alt", "speculative"}
-                if actionable:
-                    note = st.text_input("Review note (optional)", key=f"note_{idea['id']}")
-                    if idea.get("command"):
-                        c1, c2, c3 = st.columns(3)
-                    else:
-                        c1, c2 = st.columns(2)
-                    if c1.button("✅ Approve", key=f"app_{idea['id']}"):
-                        review_idea(idea["id"], "approved", note=note or None)
+                else:
+                    st.caption("_no explanation yet_")
+                if idea["status"] == "proposed":
+                    new_notes = st.text_area(
+                        "Notes — tasks, comments, review",
+                        value=idea.get("notes") or "",
+                        key=f"notes_{idea['id']}",
+                        height=120,
+                        placeholder="type here… saved to the DB on every keystroke",
+                    )
+                    if new_notes != (idea.get("notes") or ""):
+                        set_idea_notes(idea["id"], new_notes)
                         st.rerun()
-                    if c2.button("❌ Reject", key=f"rej_{idea['id']}"):
-                        review_idea(idea["id"], "rejected", note=note or None)
+                st.caption(f"id: `{idea['id']}`")
+                action_cols = st.columns([2, 1])
+                with action_cols[0]:
+                    _copy_button(idea["id"], idea["title"], key=f"copy_{idea['id']}")
+                with action_cols[1]:
+                    if st.button("🗑 Delete", key=f"del_{idea['id']}"):
+                        delete_idea(idea["id"])
                         st.rerun()
-                    if idea.get("command"):
-                        if c3.button("🚀 Approve + queue", key=f"appq_{idea['id']}"):
-                            approve_and_promote_idea(idea["id"], note=note or None)
-                            st.rerun()
-                elif idea["status"] == "approved":
-                    if idea.get("command"):
-                        if st.button("🚀 Promote to queue", key=f"prom_{idea['id']}"):
-                            promote_idea(idea["id"])
-                            st.rerun()
-                    else:
-                        st.success("Approved in DB. Add a runnable command to promote it to the queue.")
 
-    # ── Negatives (ran-and-lost) ───────────────────────────────────────────────
+    # ── Negatives (rejected ideas) ─────────────────────────────────────────────
     with tab_negatives:
-        st.caption("Experiments we actually ran that did NOT win. Kept so they are never "
-                   "re-proposed. Distinct from ideas rejected before running.")
-        cur.execute("SELECT * FROM ideas WHERE outcome='tested_negative' ORDER BY updated_at DESC")
+        st.caption("Ideas marked 'rejected'. Kept so they are never re-proposed.")
+        cur.execute("SELECT * FROM ideas WHERE status='rejected' ORDER BY created_at DESC")
         ncols = [d[0] for d in cur.description]
         negs = [dict(zip(ncols, row)) for row in cur.fetchall()]
         if not negs:
-            st.info("No tested-negative experiments recorded yet.")
+            st.info("No rejected ideas recorded yet.")
         for idea in negs:
-            with st.expander(f"❌ {idea['title']}"):
-                if idea.get("summary"):
-                    st.markdown(f"**{idea['summary']}**")
-                st.markdown(f"**Measured result:** {idea.get('expected_gain') or '—'}")
-                if idea.get("review_note"):
-                    st.markdown(idea["review_note"])
-                if idea.get("reference_url"):
-                    st.markdown(f"🔗 [{idea['reference_url']}]({idea['reference_url']})")
+            with st.expander(f"❌ {idea['title']}", expanded=True):
+                if idea.get("explanation"):
+                    st.markdown("**How it works**")
+                    st.markdown(idea["explanation"])
+                else:
+                    st.caption("_no explanation yet_")
+                st.caption(f"id: `{idea['id']}`")
+                action_cols = st.columns([2, 1])
+                with action_cols[0]:
+                    _copy_button(idea["id"], idea["title"], key=f"negcopy_{idea['id']}")
+                with action_cols[1]:
+                    if st.button("🗑 Delete", key=f"negdel_{idea['id']}"):
+                        delete_idea(idea["id"])
+                        st.rerun()
 
     # ── Runs ──────────────────────────────────────────────────────────────────
     with tab_runs:
