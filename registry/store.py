@@ -142,14 +142,21 @@ class ExperimentRegistry:
 
     def initialize(self) -> None:
         self.conn.executescript(_load_schema())
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        existing = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(ideas)").fetchall()
+        }
+        if "notes" not in existing:
+            self.conn.execute("ALTER TABLE ideas ADD COLUMN notes TEXT")
 
     def upsert_thread(
         self,
         name: str,
         *,
         hypothesis: Optional[str] = None,
-        owner: Optional[str] = None,
         status: str = "active",
         priority: int = 0,
         notes_path: Optional[str] = None,
@@ -159,18 +166,17 @@ class ExperimentRegistry:
         self.conn.execute(
             """
             INSERT INTO threads (
-                name, hypothesis, owner, status, priority, notes_path, summary, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                name, hypothesis, status, priority, notes_path, summary, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 hypothesis=excluded.hypothesis,
-                owner=excluded.owner,
                 status=excluded.status,
                 priority=excluded.priority,
                 notes_path=excluded.notes_path,
                 summary=excluded.summary,
                 updated_at=excluded.updated_at
             """,
-            (name, hypothesis, owner, status, priority, notes_path, summary, now, now),
+            (name, hypothesis, status, priority, notes_path, summary, now, now),
         )
         self.conn.commit()
 
@@ -182,10 +188,7 @@ class ExperimentRegistry:
         *,
         status: str = "planned",
         priority: int = 0,
-        depends_on: Optional[str] = None,
         gpu_class: Optional[str] = None,
-        estimated_minutes: Optional[float] = None,
-        created_by: Optional[str] = None,
         log_path: Optional[str] = None,
         output_dir: Optional[str] = None,
         decision: Optional[str] = None,
@@ -195,18 +198,15 @@ class ExperimentRegistry:
         self.conn.execute(
             """
             INSERT INTO queue_items (
-                id, thread_name, name, command, status, priority, depends_on,
-                gpu_class, estimated_minutes, created_by, created_at, started_at,
+                id, thread_name, name, command, status, priority,
+                gpu_class, created_at, started_at,
                 finished_at, log_path, output_dir, decision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
             ON CONFLICT(thread_name, name) DO UPDATE SET
                 command=excluded.command,
                 status=excluded.status,
                 priority=excluded.priority,
-                depends_on=excluded.depends_on,
                 gpu_class=excluded.gpu_class,
-                estimated_minutes=excluded.estimated_minutes,
-                created_by=excluded.created_by,
                 log_path=excluded.log_path,
                 output_dir=excluded.output_dir,
                 decision=excluded.decision
@@ -218,10 +218,7 @@ class ExperimentRegistry:
                 command,
                 status,
                 priority,
-                depends_on,
                 gpu_class,
-                estimated_minutes,
-                created_by,
                 now,
                 log_path,
                 output_dir,
@@ -276,8 +273,6 @@ class ExperimentRegistry:
         status: str = "running",
         queue_item_id: Optional[str] = None,
         command: Optional[str] = None,
-        code_commit: Optional[str] = None,
-        branch: Optional[str] = None,
         config: Optional[str] = None,
         seed: Optional[int] = None,
         tokens_target: Optional[int] = None,
@@ -294,11 +289,11 @@ class ExperimentRegistry:
         self.conn.execute(
             """
             INSERT INTO runs (
-                id, queue_item_id, thread_name, name, command, code_commit, branch, config, seed,
+                id, queue_item_id, thread_name, name, command, config, seed,
                 tokens_target, tokens_seen, actual_steps, status, verdict, output_dir,
                 metrics_path, checkpoint_path, final_val_loss, final_val_accuracy,
                 final_train_loss, git_commit, git_branch, git_dirty, created_at, finished_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NULL)
             """,
             (
                 run_id,
@@ -306,8 +301,6 @@ class ExperimentRegistry:
                 thread_name,
                 name,
                 command,
-                code_commit,
-                branch,
                 config,
                 seed,
                 tokens_target,
@@ -477,51 +470,15 @@ class ExperimentRegistry:
         self,
         title: str,
         *,
-        summary: Optional[str] = None,
         explanation: Optional[str] = None,
-        confidence: Optional[str] = None,
-        expected_gain: Optional[str] = None,
-        pros: Optional[str] = None,
-        cons: Optional[str] = None,
-        outcome: Optional[str] = None,
-        reference_url: Optional[str] = None,
-        thread_name: Optional[str] = None,
-        hypothesis: Optional[str] = None,
-        lever: Optional[str] = None,
-        rationale: Optional[str] = None,
-        expected_effect: Optional[str] = None,
-        scale_target: Optional[str] = None,
-        command: Optional[str] = None,
-        gpu_class: Optional[str] = None,
-        estimated_minutes: Optional[float] = None,
-        priority: int = 0,
         status: str = "proposed",
-        proposed_by: Optional[str] = None,
         idea_id: Optional[str] = None,
     ) -> str:
         return self.upsert_idea(
             idea_id or new_id(),
             title,
-            summary=summary,
             explanation=explanation,
-            confidence=confidence,
-            expected_gain=expected_gain,
-            pros=pros,
-            cons=cons,
-            outcome=outcome,
-            reference_url=reference_url,
-            thread_name=thread_name,
-            hypothesis=hypothesis,
-            lever=lever,
-            rationale=rationale,
-            expected_effect=expected_effect,
-            scale_target=scale_target,
-            command=command,
-            gpu_class=gpu_class,
-            estimated_minutes=estimated_minutes,
-            priority=priority,
             status=status,
-            proposed_by=proposed_by,
             preserve_existing=False,
         )
 
@@ -530,92 +487,25 @@ class ExperimentRegistry:
         idea_id: str,
         title: str,
         *,
-        summary: Optional[str] = None,
         explanation: Optional[str] = None,
-        confidence: Optional[str] = None,
-        expected_gain: Optional[str] = None,
-        pros: Optional[str] = None,
-        cons: Optional[str] = None,
-        outcome: Optional[str] = None,
-        reference_url: Optional[str] = None,
-        thread_name: Optional[str] = None,
-        hypothesis: Optional[str] = None,
-        lever: Optional[str] = None,
-        rationale: Optional[str] = None,
-        expected_effect: Optional[str] = None,
-        scale_target: Optional[str] = None,
-        command: Optional[str] = None,
-        gpu_class: Optional[str] = None,
-        estimated_minutes: Optional[float] = None,
-        priority: int = 0,
         status: str = "proposed",
-        proposed_by: Optional[str] = None,
         preserve_existing: bool = True,
     ) -> str:
         now = utc_now()
         row = self.conn.execute("SELECT created_at FROM ideas WHERE id = ?", (idea_id,)).fetchone()
         created_at = row["created_at"] if row else now
-        current = self.get_idea(idea_id) if row else None
         self.conn.execute(
             """
-            INSERT INTO ideas (
-                id, title, summary, explanation, confidence, expected_gain, pros, cons, outcome, reference_url,
-                thread_name, hypothesis, lever, rationale, expected_effect, scale_target,
-                command, gpu_class, estimated_minutes, priority, status, proposed_by,
-                reviewed_by, review_note, reviewed_at, queue_item_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+            INSERT INTO ideas (id, title, explanation, status, created_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
-                summary = excluded.summary,
-                explanation = excluded.explanation,
-                confidence = excluded.confidence,
-                expected_gain = excluded.expected_gain,
-                pros = excluded.pros,
-                cons = excluded.cons,
-                outcome = excluded.outcome,
-                reference_url = excluded.reference_url,
-                thread_name = excluded.thread_name,
-                hypothesis = excluded.hypothesis,
-                lever = excluded.lever,
-                rationale = excluded.rationale,
-                expected_effect = excluded.expected_effect,
-                scale_target = excluded.scale_target,
-                command = excluded.command,
-                gpu_class = excluded.gpu_class,
-                estimated_minutes = excluded.estimated_minutes,
-                priority = excluded.priority,
-                proposed_by = excluded.proposed_by,
-                updated_at = excluded.updated_at
+                explanation = excluded.explanation
                 {status_clause}
             """.format(
                 status_clause="" if preserve_existing else ", status = excluded.status",
             ),
-            (
-                idea_id,
-                title,
-                summary,
-                explanation,
-                confidence,
-                expected_gain,
-                pros,
-                cons,
-                outcome,
-                reference_url,
-                thread_name,
-                hypothesis,
-                lever,
-                rationale,
-                expected_effect,
-                scale_target,
-                command,
-                gpu_class,
-                estimated_minutes,
-                priority,
-                status,
-                proposed_by,
-                created_at,
-                now,
-            ),
+            (idea_id, title, explanation, status, created_at),
         )
         self.conn.commit()
         return idea_id
@@ -627,36 +517,15 @@ class ExperimentRegistry:
         thread_name: str = "recipe",
     ) -> int:
         imported = 0
-        existing_thread = self.conn.execute(
-            "SELECT name FROM threads WHERE name = ?",
-            (thread_name,),
-        ).fetchone()
-        if not existing_thread:
-            self.upsert_thread(
-                thread_name,
-                hypothesis="Known levers backlog imported from docs/KNOWN_LEVERS.md",
-                status="active",
-                priority=1,
-                notes_path=str(markdown_path),
-            )
         for row in _parse_known_lever_rows(markdown_path):
             lever_title = row["lever"]
             idea_id = f"known-lever-{row['row_num']:02d}-{_slugify(lever_title)}"
-            priority = 0 if "value residual" in lever_title.lower() else row["row_num"]
             explanation = f"Section: {row['section']}\nNotes: {row['notes']}" if row["section"] else row["notes"]
             self.upsert_idea(
                 idea_id,
                 lever_title,
-                summary=row["what_it_is"],
                 explanation=explanation,
-                outcome=row["raw_status"],
-                reference_url=str(markdown_path),
-                thread_name=thread_name,
-                lever=lever_title,
-                rationale=row["notes"],
-                priority=priority,
                 status=row["status"],
-                proposed_by="docs/KNOWN_LEVERS.md",
                 preserve_existing=True,
             )
             imported += 1
@@ -665,12 +534,12 @@ class ExperimentRegistry:
     def list_ideas(self, status: Optional[str] = None) -> list:
         if status:
             rows = self.conn.execute(
-                "SELECT * FROM ideas WHERE status = ? ORDER BY priority, created_at",
+                "SELECT * FROM ideas WHERE status = ? ORDER BY created_at",
                 (status,),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT * FROM ideas ORDER BY priority, created_at"
+                "SELECT * FROM ideas ORDER BY created_at"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -678,97 +547,21 @@ class ExperimentRegistry:
         row = self.conn.execute("SELECT * FROM ideas WHERE id = ?", (idea_id,)).fetchone()
         return dict(row) if row else None
 
-    def review_idea(
-        self,
-        idea_id: str,
-        *,
-        decision: str,
-        reviewed_by: Optional[str] = None,
-        review_note: Optional[str] = None,
-    ) -> str:
-        """Approve or reject a proposed idea. decision in {approve, reject}."""
-        status = {"approve": "approved", "reject": "rejected"}.get(decision, decision)
-        now = utc_now()
-        self.conn.execute(
-            """
-            UPDATE ideas
-            SET status = ?, reviewed_by = ?, review_note = ?, reviewed_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (status, reviewed_by, review_note, now, now, idea_id),
+    def delete_idea(self, idea_id: str) -> bool:
+        cur = self.conn.execute(
+            "DELETE FROM ideas WHERE id = ?",
+            (idea_id,),
         )
         self.conn.commit()
-        return status
+        return cur.rowcount > 0
 
-    def approve_and_promote_idea(
-        self,
-        idea_id: str,
-        *,
-        reviewed_by: Optional[str] = None,
-        review_note: Optional[str] = None,
-        created_by: str = "registry",
-    ) -> str:
-        self.review_idea(
-            idea_id,
-            decision="approve",
-            reviewed_by=reviewed_by,
-            review_note=review_note,
-        )
-        return self.promote_idea_to_queue(
-            idea_id,
-            created_by=created_by,
-            require_approved=True,
-        )
-
-    def promote_idea_to_queue(
-        self,
-        idea_id: str,
-        *,
-        created_by: str = "registry",
-        require_approved: bool = True,
-    ) -> str:
-        """Materialize an approved idea into a runnable queue_item.
-
-        Creates the parent thread if missing, copies the command, and links the
-        idea to the new queue item (idea status -> queued).
-        """
-        idea = self.get_idea(idea_id)
-        if not idea:
-            raise KeyError(f"idea not found: {idea_id}")
-        if require_approved and idea["status"] != "approved":
-            raise ValueError(
-                f"idea {idea_id} is '{idea['status']}', must be 'approved' before promoting"
-            )
-        if not idea["command"]:
-            raise ValueError(f"idea {idea_id} has no command to run")
-        thread_name = idea["thread_name"] or "inbox"
-        existing = self.conn.execute(
-            "SELECT name FROM threads WHERE name = ?", (thread_name,)
-        ).fetchone()
-        if not existing:
-            self.upsert_thread(
-                thread_name,
-                hypothesis=idea["hypothesis"],
-                status="active",
-                priority=idea["priority"],
-            )
-        queue_id = self.upsert_queue_item(
-            thread_name,
-            idea["title"],
-            idea["command"],
-            status="planned",
-            priority=idea["priority"],
-            gpu_class=idea["gpu_class"],
-            estimated_minutes=idea["estimated_minutes"],
-            created_by=created_by,
-        )
-        now = utc_now()
+    def set_idea_notes(self, idea_id: str, notes: str) -> str:
         self.conn.execute(
-            "UPDATE ideas SET status = 'queued', queue_item_id = ?, updated_at = ? WHERE id = ?",
-            (queue_id, now, idea_id),
+            "UPDATE ideas SET notes = ? WHERE id = ?",
+            (notes, idea_id),
         )
         self.conn.commit()
-        return queue_id
+        return notes
 
     def import_metrics(
         self,
