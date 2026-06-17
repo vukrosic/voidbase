@@ -96,6 +96,28 @@ def _pg_rows(sql: str, params: tuple = ()) -> list[dict]:
         return []
 
 
+def _pg_exec(sql: str, params: tuple = ()) -> list[dict]:
+    """Write helper (INSERT/UPDATE … RETURNING). Same reconnect-and-retry as
+    _pg_rows; autocommit is on so each call is its own transaction. Postgres
+    only — the SQLite backend is read-only for the dashboard."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with _pg_lock:
+        for attempt in (1, 2):
+            try:
+                conn = _pg_connection()
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(sql, params)
+                    return list(cur.fetchall()) if cur.description else []
+            except psycopg.OperationalError:
+                global _pg_conn
+                _pg_conn = None
+                if attempt == 2:
+                    raise
+        return []
+
+
 def _sqlite_rows(sql: str, params: tuple = ()) -> list[dict]:
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
@@ -243,6 +265,46 @@ def health() -> dict:
     return {"ok": ok, "db": db_label, "backend": BACKEND, "counts": counts}
 
 
+def upsert_thread(body: dict) -> dict:
+    """Create or update a research thread by name (the PK). Only the fields
+    present in `body` are written; omitted fields keep their current value via
+    COALESCE on conflict. Returns the resulting row."""
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise ValueError("thread 'name' is required")
+    cols = {
+        "hypothesis": body.get("hypothesis"),
+        "goal_prompt": body.get("goal_prompt"),
+        "kind": body.get("kind") or "question",
+        "submit_via": body.get("submit_via") or "pr",
+        "repo_url": body.get("repo_url"),
+        "status": body.get("status") or "active",
+        "priority": int(body.get("priority") or 0),
+        "summary": body.get("summary"),
+    }
+    out = _pg_exec(
+        """
+        insert into threads (name, hypothesis, goal_prompt, kind, submit_via,
+                             repo_url, status, priority, summary)
+        values (%(name)s, %(hypothesis)s, %(goal_prompt)s, %(kind)s, %(submit_via)s,
+                %(repo_url)s, %(status)s, %(priority)s, %(summary)s)
+        on conflict (name) do update set
+            hypothesis  = coalesce(excluded.hypothesis,  threads.hypothesis),
+            goal_prompt = coalesce(excluded.goal_prompt, threads.goal_prompt),
+            kind        = excluded.kind,
+            submit_via  = excluded.submit_via,
+            repo_url    = coalesce(excluded.repo_url, threads.repo_url),
+            status      = excluded.status,
+            priority    = excluded.priority,
+            summary     = coalesce(excluded.summary, threads.summary),
+            updated_at  = now()
+        returning *
+        """,
+        {"name": name, **cols},
+    )
+    return out[0] if out else {}
+
+
 ROUTES = {
     "/health": health,
     "/activity": activity,
@@ -264,6 +326,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        """The only write the dashboard performs: author / update a research
+        thread. Localhost, single operator, no auth — see module docstring."""
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as e:  # noqa: BLE001
+            self._send(400, {"error": f"bad json: {e}"})
+            return
+        if path != "/threads":
+            self._send(404, {"error": "not found", "writable": ["/threads"]})
+            return
+        if not PG_URL:
+            self._send(501, {"error": "thread authoring requires the Postgres backend"})
+            return
+        try:
+            self._send(200, upsert_thread(body))
+        except Exception as e:  # noqa: BLE001
+            self._send(500, {"error": str(e)})
 
     def do_GET(self) -> None:  # noqa: N802 - http.server API
         parsed = urlparse(self.path)
