@@ -366,6 +366,14 @@ def upsert_thread(body: dict) -> dict:
     name = (body.get("name") or "").strip()
     if not name:
         raise ValueError("thread 'name' is required")
+    # tags: a JSON array of free-text strings (migration 0008). Passed as None
+    # when the caller omits the key so the COALESCE below preserves whatever was
+    # there — an update that doesn't mention tags must not wipe them. A bad type
+    # (not a list) is coerced to [] rather than rejected, matching the lenient
+    # write path of the rest of this function.
+    tags = body.get("tags")
+    if tags is not None and not isinstance(tags, list):
+        tags = []
     cols = {
         "hypothesis": body.get("hypothesis"),
         "goal_prompt": body.get("goal_prompt"),
@@ -375,13 +383,15 @@ def upsert_thread(body: dict) -> dict:
         "status": body.get("status") or "active",
         "priority": int(body.get("priority") or 0),
         "summary": body.get("summary"),
+        "tags": json.dumps(tags) if tags is not None else None,
     }
     out = _pg_exec(
         """
         insert into threads (name, hypothesis, goal_prompt, kind, submit_via,
-                             repo_url, status, priority, summary)
+                             repo_url, status, priority, summary, tags)
         values (%(name)s, %(hypothesis)s, %(goal_prompt)s, %(kind)s, %(submit_via)s,
-                %(repo_url)s, %(status)s, %(priority)s, %(summary)s)
+                %(repo_url)s, %(status)s, %(priority)s, %(summary)s,
+                coalesce(%(tags)s::jsonb, '[]'::jsonb))
         on conflict (name) do update set
             hypothesis  = coalesce(excluded.hypothesis,  threads.hypothesis),
             goal_prompt = coalesce(excluded.goal_prompt, threads.goal_prompt),
@@ -391,6 +401,7 @@ def upsert_thread(body: dict) -> dict:
             status      = excluded.status,
             priority    = excluded.priority,
             summary     = coalesce(excluded.summary, threads.summary),
+            tags        = coalesce(%(tags)s::jsonb, threads.tags),
             updated_at  = now()
         returning *
         """,
