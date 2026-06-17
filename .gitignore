@@ -11,3 +11,7 @@ __pycache__/
 
 # generated cutover seed (regenerate via import_from_sqlite.py)
 supabase/seed_from_sqlite.sql
+
+# secrets
+.env
+.env.local
