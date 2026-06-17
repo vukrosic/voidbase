@@ -27,12 +27,18 @@ create table if not exists contributors (
 );
 
 create table if not exists boxes (
-    id              uuid primary key default gen_random_uuid(),
-    contributor_id  uuid not null references contributors (id) on delete cascade,
-    label           text,
-    gpu_class       text,
-    fingerprint     text,
-    created_at      timestamptz not null default now(),
+    id               uuid primary key default gen_random_uuid(),
+    contributor_id   uuid not null references contributors (id) on delete cascade,
+    label            text,
+    gpu_class        text,
+    fingerprint      text,
+    -- Health / graceful recovery (0006): a worker pings last_heartbeat while a
+    -- job runs; the reaper requeues stranded jobs and marks a dark box offline.
+    last_heartbeat   timestamptz,
+    status           text not null default 'unknown'
+                         check (status in ('healthy', 'offline', 'unknown')),
+    failed_run_count integer not null default 0,
+    created_at       timestamptz not null default now(),
     unique (contributor_id, fingerprint)
 );
 
@@ -206,6 +212,7 @@ create table if not exists decisions (
 -- Indexes
 -- ---------------------------------------------------------------------------
 
+create index if not exists idx_boxes_heartbeat           on boxes (last_heartbeat);
 create index if not exists idx_ideas_status              on ideas (status);
 create index if not exists idx_queue_items_thread_status on queue_items (thread_name, status);
 create index if not exists idx_queue_items_claimable     on queue_items (status, priority desc) where status = 'needs-run';

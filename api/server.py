@@ -17,8 +17,8 @@ is purely "is DATABASE_URL set?".
   python3 api/server.py            # serves on http://localhost:8787
   VOIDBASE_PORT=9000 python3 api/server.py
 
-Endpoints (all GET, JSON):
-  /health        liveness + row counts + which backend is live
+Endpoints (GET unless noted, JSON):
+  /health        liveness + row counts + per-box health + which backend is live
   /runs          training runs (verification + has_eval)
   /threads       hypotheses
   /comparisons   paired deltas (is_paired: real on PG, false on SQLite)
@@ -26,6 +26,9 @@ Endpoints (all GET, JSON):
   /ideas         backlog
   /queue         job queue
   /eval?run_id=  per-step learning curve for one run
+
+  POST /threads        author / update a research thread (dashboard)
+  POST /box_heartbeat  {box_id, gpu_class?} liveness ping from a worker (PG-only)
 """
 from __future__ import annotations
 
@@ -299,7 +302,46 @@ def health() -> dict:
     except Exception as e:  # noqa: BLE001 - surface any DB error to the client
         return {"ok": False, "db": BACKEND, "backend": BACKEND, "error": str(e)}
     db_label = "neon" if PG_URL else str(DB_PATH)
-    return {"ok": ok, "db": db_label, "backend": BACKEND, "counts": counts}
+    result = {"ok": ok, "db": db_label, "backend": BACKEND, "counts": counts}
+    # Per-box health so the cockpit can show which GPUs are alive at a glance.
+    # Postgres-only (the boxes health columns live on the distributed store);
+    # best-effort — a boxes query error must never take /health down.
+    if PG_URL:
+        try:
+            result["boxes"] = _pg_rows(
+                """select label, status, last_heartbeat, failed_run_count,
+                          extract(epoch from (now() - last_heartbeat))::int as heartbeat_age_s
+                   from boxes
+                   order by label nulls last""")
+        except Exception:  # noqa: BLE001
+            pass
+    return result
+
+
+def box_heartbeat(body: dict) -> dict:
+    """Record a liveness ping from a worker's box: stamp last_heartbeat=now() and
+    mark it 'healthy' (and refresh gpu_class if the worker reported one). The
+    reaper reads last_heartbeat to tell a live box from one that went dark
+    mid-run. Postgres-only — the SQLite legacy store has no live boxes.
+
+    Idempotent: a missing box id is a client error (the worker creates its box
+    row before pinging), not a silent insert — we never fabricate a box with no
+    contributor."""
+    box_id = (body.get("box_id") or "").strip()
+    if not box_id:
+        raise ValueError("box_heartbeat requires 'box_id'")
+    out = _pg_exec(
+        """update boxes
+           set last_heartbeat = now(),
+               status = 'healthy',
+               gpu_class = coalesce(%(gpu_class)s, gpu_class)
+           where id = %(box_id)s::uuid
+           returning id, label, status, last_heartbeat, gpu_class, failed_run_count""",
+        {"box_id": box_id, "gpu_class": body.get("gpu_class")},
+    )
+    if not out:
+        raise ValueError(f"no box with id {box_id}")
+    return out[0]
 
 
 def upsert_thread(body: dict) -> dict:
@@ -426,11 +468,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802 - http.server API
-        """Writes the dashboard performs, all on /threads (localhost, single
-        operator, no auth — see module docstring):
-          * author / update a thread          (default)
-          * claim a thread     action=claim    (sets claimed_by + 48h expiry)
-          * release a claim    action=release  (clears the claim fields)"""
+        """The writes the platform performs (localhost, single operator, no auth
+        — see module docstring):
+          * author / update a research thread   (the dashboard, default on /threads)
+          * claim a thread       action=claim    (sets claimed_by + 48h expiry)
+          * release a claim      action=release  (clears the claim fields)
+          * record a box heartbeat               (the worker, /box_heartbeat)
+
+        Dispatch is by URL path (/threads, /box_heartbeat); a client may instead
+        POST the base URL with a {resource: '...'} field in the body — the worker
+        sends {resource: 'box_heartbeat', box_id, gpu_class?}."""
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
@@ -439,18 +486,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             self._send(400, {"error": f"bad json: {e}"})
             return
-        if path != "/threads":
-            self._send(404, {"error": "not found", "writable": ["/threads"]})
+        resource = path.lstrip("/") or str(body.get("resource") or "")
+        writable = {"threads", "box_heartbeat"}
+        if resource not in writable:
+            self._send(404, {"error": "not found", "writable": sorted(writable)})
             return
         if not PG_URL:
-            self._send(501, {"error": "thread writes require the Postgres backend"})
+            self._send(501, {"error": f"{resource} writes require the Postgres backend"})
             return
-        action = (body.get("action") or "").strip().lower()
-        handler = {"claim": claim_thread, "release": release_thread}.get(
-            action, upsert_thread)
+        if resource == "box_heartbeat":
+            handler = box_heartbeat
+        else:  # threads — author/update, or claim/release by action
+            action = (body.get("action") or "").strip().lower()
+            handler = {"claim": claim_thread, "release": release_thread}.get(
+                action, upsert_thread)
         try:
             self._send(200, handler(body))
-        except ValueError as e:  # bad input / contention — client-correctable
+        except ValueError as e:  # bad/insufficient input from the client
             self._send(400, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
             self._send(500, {"error": str(e)})

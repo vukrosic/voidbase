@@ -108,6 +108,59 @@ until the Supabase backend is stood up and the loop is migrated to write through
 the API. Do not delete `registry/` before the cutover — see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the staged plan.
 
+## Box health & graceful recovery
+
+A GPU box that drops mid-run must not strand its job. Three pieces keep
+unattended boxes self-healing (schema: `boxes.last_heartbeat`, `boxes.status`,
+`boxes.failed_run_count` — migration `db/migrations/0006_box_health.sql`):
+
+1. **Heartbeat (worker → API).** While a job runs, `scripts/worker.py` POSTs
+   `box_heartbeat` (`{box_id, gpu_class?}`) to the API every ~30s, which stamps
+   `last_heartbeat = now()` and marks the box `healthy`. If the dispatcher dies,
+   the pings stop.
+2. **Reaper (`scripts/reaper.py`).** Every ~60s it requeues any `claimed` /
+   `running` job whose **lease expired** OR whose **box went dark** (no heartbeat
+   for >90s): the job goes back to `needs-run`, `claimed_by_box` is cleared, the
+   box's `failed_run_count` is bumped and it is marked `offline`. Every requeue is
+   logged; it is idempotent and never flaps (a requeued job is `needs-run`, so the
+   next sweep ignores it). Run it alongside the worker:
+
+   ```bash
+   python3 scripts/reaper.py loop          # sweep every 60s
+   ```
+
+3. **Health surface.** `GET /health` includes a `boxes` array
+   (`{label, status, last_heartbeat, failed_run_count, heartbeat_age_s}`) so the
+   cockpit shows box health at a glance.
+
+### Credentials (no secrets in source)
+
+The SSH/box target is **never hard-coded** — `scripts/worker.py` reads it from
+the environment or the gitignored `voidbase/.env` (via `db.conn.env_value`).
+Copy [`.env.example`](.env.example) to `.env` and set at least:
+
+| Var                  | Meaning                              |
+| -------------------- | ------------------------------------ |
+| `VOIDBASE_BOX_HOST`  | the box address — **required**       |
+| `VOIDBASE_BOX_PORT`  | SSH port (default `22`)              |
+| `VOIDBASE_BOX_USER`  | SSH user (default `root`)            |
+| `VOIDBASE_BOX_REPO`  | research repo path on the box        |
+| `VOIDBASE_BOX_PYTHON`| python on the box                    |
+
+The worker refuses to run a job (`once`/`loop`) if `VOIDBASE_BOX_HOST` is unset,
+with a message pointing here. `.env` stays gitignored — no host, port, or
+connection string is ever committed.
+
+### Dataset cache (skip the ~15GB re-download)
+
+The training dataset is large; re-downloading it every run is wasted time. Set
+`VOIDBASE_DATASET_CACHE` to a directory on the **box's persistent volume** and
+the worker exports `HF_HOME` / `HF_DATASETS_CACHE` pointing at it before each
+training command, so HuggingFace downloads the dataset once and reuses it on
+every subsequent run (it skips the download when the data is already present).
+Leave it unset to keep the box's default behavior. Provision the directory at
+box-setup time so it survives restarts.
+
 ## Running locally (once Supabase CLI is installed)
 
 ```bash

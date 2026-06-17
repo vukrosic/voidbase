@@ -36,14 +36,16 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
 os.environ.setdefault("PGCONNECT_TIMEOUT", "10")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from db.conn import connect  # noqa: E402
+from db.conn import connect, env_value  # noqa: E402
 
 DEFAULT_REPO = Path("/Users/vukrosic/my-life/llm-research-kit-scaling")
 LEASE_SECONDS = int(os.environ.get("VOIDBASE_LEASE_SECONDS", "1800"))
@@ -54,17 +56,38 @@ THREAD_FALLBACK = "tiny1m3m"
 # CRITICAL: Neon write-creds (DATABASE_URL/.env) stay on THIS machine. The worker
 # runs here (where the creds live) and executes the experiment ON THE BOX over
 # SSH, capturing stdout. We never copy the connection string to rented infra.
-BOX_SSH_HOST = os.environ.get("VOIDBASE_BOX_HOST", "1.208.108.242")
-BOX_SSH_PORT = os.environ.get("VOIDBASE_BOX_PORT", "52646")
-BOX_SSH_USER = os.environ.get("VOIDBASE_BOX_USER", "root")
-BOX_REPO = os.environ.get("VOIDBASE_BOX_REPO", "/root/universe-lm")
-BOX_PYTHON = os.environ.get("VOIDBASE_BOX_PYTHON", "/venv/main/bin/python")
+#
+# The SSH target is NEVER hard-coded — it is read from the environment or the
+# gitignored voidbase/.env (see db.conn.env_value), so no box address or port
+# ever lands in a commit. Set VOIDBASE_BOX_HOST / _PORT / _USER (see README and
+# .env.example). The host is required for `once`/`loop`; main() fails fast with a
+# clear message if it is unset.
+BOX_SSH_HOST = env_value("VOIDBASE_BOX_HOST")
+BOX_SSH_PORT = env_value("VOIDBASE_BOX_PORT", "22")
+BOX_SSH_USER = env_value("VOIDBASE_BOX_USER", "root")
+BOX_REPO = env_value("VOIDBASE_BOX_REPO", "/root/universe-lm")
+BOX_PYTHON = env_value("VOIDBASE_BOX_PYTHON", "/venv/main/bin/python")
 # Box-prep env exported before every training command. sm_86 (RTX 3060) crashes
 # mid-run unless torch.compile/dynamo is OFF — remote-box.json documents this and
 # the old daemon path set it; the config-row path MUST too (a missing
 # TORCHDYNAMO_DISABLE was the headmix run's 7.14 "failed" crash). Harmless on
 # other GPUs. Override per-box with VOIDBASE_BOX_ENV.
-BOX_ENV = os.environ.get("VOIDBASE_BOX_ENV", "TORCHDYNAMO_DISABLE=1")
+BOX_ENV = env_value("VOIDBASE_BOX_ENV", "TORCHDYNAMO_DISABLE=1")
+# Dataset cache: a persistent dir ON THE BOX where the ~15GB dataset is downloaded
+# once and reused, instead of re-fetched every run. When VOIDBASE_DATASET_CACHE is
+# set we export HF_HOME / HF_DATASETS_CACHE pointing at it before the training
+# command, so HuggingFace skips the download when the data is already present. The
+# dir must live on the box's PERSISTENT volume (survives a box restart). Unset =>
+# unchanged behavior. See README "Dataset cache".
+DATASET_CACHE = env_value("VOIDBASE_DATASET_CACHE")
+
+# --- heartbeat: prove this box is alive so the reaper doesn't requeue its job --
+# The worker pings the voidbase API every HEARTBEAT_SECONDS while a job runs. If
+# THIS process (the dispatcher driving the box) dies, the pings stop and the
+# reaper requeues the stranded job after the heartbeat timeout — exactly the
+# self-healing the loop needs. Best-effort: a ping failure never touches the run.
+API_URL = env_value("VOIDBASE_API_URL", "http://127.0.0.1:8787")
+HEARTBEAT_SECONDS = int(env_value("VOIDBASE_HEARTBEAT_SECONDS", "30"))
 # Where the full box stdout/stderr of every run is saved. Neon stores only the
 # parsed val + done/failed; a crashing lever (e.g. headmix) needs the actual
 # traceback to debug. One file per job, overwritten on retry.
@@ -74,6 +97,47 @@ RUN_LOG_DIR = Path(os.environ.get("VOIDBASE_RUN_LOG_DIR",
 
 def log(msg: str) -> None:
     print(f"[worker {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
+
+
+# --- heartbeat ---------------------------------------------------------------
+
+def post_heartbeat(box_id: str) -> None:
+    """Best-effort liveness ping to the voidbase API (POST box_heartbeat). Never
+    raises — a missing API server or a network blip must not kill a multi-minute
+    training run; the reaper handles a genuinely dead box, not a flaky ping."""
+    payload = json.dumps({"resource": "box_heartbeat", "box_id": box_id}).encode()
+    req = urllib.request.Request(
+        f"{API_URL.rstrip('/')}/box_heartbeat", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:  # noqa: BLE001
+        log(f"heartbeat failed ({type(e).__name__}: {e}) — continuing")
+
+
+class Heartbeat:
+    """Pings the API every HEARTBEAT_SECONDS in a background thread for the
+    lifetime of one run. Start before the box command, stop in a finally. The
+    first beat fires immediately so a job is marked live the instant it starts."""
+
+    def __init__(self, box_id: str) -> None:
+        self.box_id = box_id
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        post_heartbeat(self.box_id)  # immediate first beat
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(HEARTBEAT_SECONDS):
+            post_heartbeat(self.box_id)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
 
 
 # --- identity: who is this worker -------------------------------------------
@@ -228,6 +292,11 @@ def build_remote_cmd(job: dict, dry: bool) -> str:
     if dry and "run_experiment.py" in cmd and "--dry" not in cmd:
         cmd += " --dry"
     prefix = f"cd {shlex.quote(BOX_REPO)} && {BOX_ENV} "
+    if DATASET_CACHE:
+        cache = shlex.quote(DATASET_CACHE)
+        # Point HuggingFace at the persistent cache so the dataset downloads once
+        # and is reused on every subsequent run (skips the ~15GB re-fetch).
+        prefix += f"HF_HOME={cache} HF_DATASETS_CACHE={cache} "
     config = job.get("config")
     if config is not None:
         prefix += f"EXPERIMENT_CONFIG={shlex.quote(json.dumps(config))} "
@@ -267,6 +336,10 @@ def run_one(repo: Path, box_id: str) -> bool:
 
     remote_cmd = build_remote_cmd(job, DRY)
     log(f"box <- {remote_cmd[:160]}")
+    # Ping every ~30s for the life of the run so the reaper can tell this box is
+    # alive. If this dispatcher dies, the pings stop and the job is requeued.
+    heartbeat = Heartbeat(box_id)
+    heartbeat.start()
     try:
         rc, out = run_on_box(remote_cmd)            # no DB connection held here
         ok = rc == 0 and (not DRY or "DRY_OK" in out)
@@ -276,6 +349,8 @@ def run_one(repo: Path, box_id: str) -> bool:
     except Exception as e:  # noqa: BLE001
         log(f"{job['id']} crashed: {e}")
         rc, out, ok = -1, str(e), False
+    finally:
+        heartbeat.stop()
 
     # Persist the FULL box output so a failed run is debuggable (Neon keeps only
     # the parsed val). Best-effort: never let logging break the report.
@@ -383,6 +458,14 @@ def main() -> int:
             return claim_test(conn)
         finally:
             conn.close()
+
+    # The SSH target is never hard-coded — running a job needs it set in the env
+    # or voidbase/.env. Fail fast with the exact var name instead of SSHing to
+    # "None". (claim-test above never touches a box, so it doesn't need this.)
+    if not BOX_SSH_HOST:
+        log("VOIDBASE_BOX_HOST is not set — put the box address in the environment "
+            "or voidbase/.env (see README / .env.example). Refusing to run a job.")
+        return 2
 
     # Identity once on its own connection; run_one then manages per-op connections.
     conn = connect()
