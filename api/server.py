@@ -233,6 +233,72 @@ def threads() -> list[dict]:
     return out
 
 
+# Fields an external agent needs to choose work. The full goal_prompt is
+# deliberately NOT here — it's large; fetch it per-thread via /threads/goal.
+_PUBLIC_THREAD_FIELDS = (
+    "name", "hypothesis", "kind", "priority", "repo_url", "submit_via", "status",
+    "claimed_by", "claim_expires_at", "run_count_last_7d", "run_count_all_time",
+)
+
+
+def threads_public(status: str | None = "active", unclaimed: bool = False) -> list[dict]:
+    """Read-only, agent-facing thread list — the destination the landing-page
+    prompt points autonomous agents at, so they can self-direct ("show me
+    high-priority unclaimed threads") instead of reading a stale champion.json.
+
+    Distinct from /threads (the dashboard read, which carries the full rows incl.
+    goal_prompt and which the research board depends on). This trims to
+    _PUBLIC_THREAD_FIELDS, adds run_count_all_time + run_count_last_7d, applies
+    optional status / unclaimed filters, and sorts important-and-trending first
+    (priority desc, then recent activity). Expired claims read back as unclaimed.
+
+    Portable: built on `select t.*` + a Python trim, so a backend missing the
+    Postgres-only claim/goal columns (legacy SQLite) still works — absent fields
+    are simply not in the output and `unclaimed` becomes a no-op."""
+    sql_pg = (
+        "select t.*, "
+        "(t.claim_expires_at is not null and t.claim_expires_at < now()) "
+        "  as claim_expired, "
+        "(select count(*) from runs r where r.thread_name = t.name "
+        "   and r.created_at > now() - interval '7 days') as run_count_last_7d, "
+        "(select count(*) from runs r where r.thread_name = t.name) "
+        "  as run_count_all_time "
+        "from threads t")
+    sql_sqlite = (
+        "select t.*, "
+        "(select count(*) from runs r where r.thread_name = t.name "
+        "   and r.created_at > datetime('now','-7 days')) as run_count_last_7d, "
+        "(select count(*) from runs r where r.thread_name = t.name) "
+        "  as run_count_all_time "
+        "from threads t")
+    out = []
+    for r in rows(sql_pg, sql_sqlite):
+        if r.pop("claim_expired", False):  # lazy auto-release on read
+            r["claimed_by"] = None
+            r["claim_expires_at"] = None
+        if status and (r.get("status") or "active") != status:
+            continue
+        if unclaimed and r.get("claimed_by"):
+            continue
+        out.append({k: r[k] for k in _PUBLIC_THREAD_FIELDS if k in r})
+    out.sort(key=lambda r: (-(r.get("priority") or 0), -(r.get("run_count_last_7d") or 0)))
+    return out
+
+
+def thread_goal(name: str) -> dict:
+    """The full goal_prompt for ONE thread — the brief an agent executes
+    end-to-end. Split out of the list payload because it's large; mirrors the
+    /eval?run_id= query-param pattern."""
+    out = rows(
+        "select name, goal_prompt from threads where name = %s",
+        "select name, goal_prompt from threads where name = ?",
+        (name,),
+    )
+    if not out:
+        raise ValueError(f"no such thread: {name}")
+    return out[0]
+
+
 def activity() -> dict:
     """Live 'what is being worked on RIGHT NOW' snapshot for the dashboard.
     Postgres-only (the distributed store): in-flight claims, active boxes, and
@@ -510,17 +576,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - http.server API
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/health"
+        q = parse_qs(parsed.query)
         try:
             if path == "/eval":
-                run_id = parse_qs(parsed.query).get("run_id", [""])[0]
-                self._send(200, eval_points(run_id))
+                self._send(200, eval_points(q.get("run_id", [""])[0]))
+                return
+            if path == "/threads/public":
+                status = q.get("status", ["active"])[0] or None
+                unclaimed = q.get("unclaimed", ["false"])[0].lower() in ("1", "true", "yes")
+                self._send(200, threads_public(status=status, unclaimed=unclaimed))
+                return
+            if path == "/threads/goal":
+                self._send(200, thread_goal(q.get("name", [""])[0]))
                 return
             handler = ROUTES.get(path)
             if handler is None:
-                routes = sorted([*ROUTES, "/eval?run_id="])
+                routes = sorted([*ROUTES, "/eval?run_id=",
+                                 "/threads/public?status=&unclaimed=", "/threads/goal?name="])
                 self._send(404, {"error": "not found", "routes": routes})
                 return
             self._send(200, handler())
+        except ValueError as e:  # e.g. unknown thread name — client-correctable
+            self._send(404, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
             self._send(500, {"error": str(e)})
 
