@@ -27,7 +27,7 @@ import os
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 DB_PATH = Path(__file__).resolve().parent.parent / "registry" / "experiments.sqlite"
 
@@ -47,8 +47,15 @@ def _rows(sql: str) -> list[dict]:
 
 
 def runs() -> list[dict]:
+    with _connect() as conn:
+        have_eval = {
+            row[0] for row in conn.execute(
+                "select distinct run_id from eval_points")
+        }
+        rows = [dict(r) for r in conn.execute(
+            "select * from runs order by created_at desc")]
     out = []
-    for r in _rows("select * from runs order by created_at desc"):
+    for r in rows:
         out.append({
             "id": r["id"],
             "thread_name": r.get("thread_name"),
@@ -64,8 +71,21 @@ def runs() -> list[dict]:
             "git_branch": r.get("git_branch"),
             "created_at": r.get("created_at"),
             "finished_at": r.get("finished_at"),
+            "has_eval": r["id"] in have_eval,
         })
     return out
+
+
+def eval_points(run_id: str) -> list[dict]:
+    """The per-step learning curve for one run, oldest step first."""
+    if not run_id:
+        return []
+    with _connect() as conn:
+        cur = conn.execute(
+            "select step, tokens, val_loss, val_accuracy, val_perplexity, "
+            "learning_rate, elapsed_seconds from eval_points "
+            "where run_id = ? order by step asc", (run_id,))
+        return [dict(r) for r in cur]
 
 
 def comparisons() -> list[dict]:
@@ -124,12 +144,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - http.server API
-        path = urlparse(self.path).path.rstrip("/") or "/health"
-        handler = ROUTES.get(path)
-        if handler is None:
-            self._send(404, {"error": "not found", "routes": sorted(ROUTES)})
-            return
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/health"
         try:
+            # /eval?run_id=<id> — the per-step curve for one run
+            if path == "/eval":
+                run_id = parse_qs(parsed.query).get("run_id", [""])[0]
+                self._send(200, eval_points(run_id))
+                return
+            handler = ROUTES.get(path)
+            if handler is None:
+                routes = sorted([*ROUTES, "/eval?run_id="])
+                self._send(404, {"error": "not found", "routes": routes})
+                return
             self._send(200, handler())
         except Exception as e:  # noqa: BLE001
             self._send(500, {"error": str(e)})
