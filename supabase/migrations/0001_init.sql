@@ -167,10 +167,18 @@ create table comparisons (
     baseline_seed       integer,
     box_id              uuid references boxes (id) on delete set null,
     baseline_box_id     uuid references boxes (id) on delete set null,
-    same_seed           boolean generated always as (seed is not distinct from baseline_seed) stored,
-    same_box            boolean generated always as (box_id is not distinct from baseline_box_id) stored,
+    -- NOTE: require non-null. `null is not distinct from null` is TRUE in SQL,
+    -- so without the IS NOT NULL guard a legacy/untracked row (null seed, null
+    -- box) would be falsely marked paired — the exact integrity leak we prevent.
+    same_seed           boolean generated always as
+                            (seed is not null
+                             and seed is not distinct from baseline_seed) stored,
+    same_box            boolean generated always as
+                            (box_id is not null
+                             and box_id is not distinct from baseline_box_id) stored,
     is_paired           boolean generated always as
-                            (seed is not distinct from baseline_seed
+                            (seed is not null and box_id is not null
+                             and seed is not distinct from baseline_seed
                              and box_id is not distinct from baseline_box_id) stored,
     matched_step        integer,
     matched_tokens      bigint,

@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# generated cutover seed (regenerate via import_from_sqlite.py)
+supabase/seed_from_sqlite.sql
