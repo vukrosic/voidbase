@@ -10,6 +10,41 @@ Auth: clients send a Supabase JWT (human session) or a scoped API key (machine).
 RLS does the row-ownership enforcement underneath; the API enforces the
 *protocol* invariants RLS can't express.
 
+## Live read endpoints (implemented — `api/server.py`)
+
+All GET, JSON, read-only, no auth (localhost single-operator). `/health`,
+`/activity`, `/runs`, `/threads`, `/comparisons`, `/champions`, `/ideas`,
+`/queue`, `/eval?run_id=`.
+
+### Agent-facing thread discovery
+
+The destination an autonomous contributor agent queries to self-direct, instead
+of reading a stale `champion.json` from the repo:
+
+- `GET /threads/public[?status=active&unclaimed=true]` — the trimmed thread list
+  for choosing work. Returns, per thread: `name`, `hypothesis`, `kind`,
+  `priority`, `repo_url`, `submit_via`, `status`, `claimed_by`,
+  `claim_expires_at`, `run_count_last_7d`, `run_count_all_time`. The large
+  `goal_prompt` is **excluded** (fetch it per-thread, below). Defaults to
+  `status=active`; `unclaimed=true` drops claimed (unexpired) threads. Sorted
+  important-and-trending first: `priority desc`, then `run_count_last_7d desc`.
+  Expired claims read back as unclaimed.
+
+  ```json
+  [{ "name": "tiny1m3m", "kind": "question", "priority": 100,
+     "status": "active", "claimed_by": null, "claim_expires_at": null,
+     "run_count_last_7d": 4, "run_count_all_time": 213,
+     "repo_url": "https://github.com/vukrosic/universe-lm", "submit_via": "pr" }]
+  ```
+
+- `GET /threads/goal?name=<thread>` — the full `goal_prompt` for ONE thread (the
+  brief an agent executes end-to-end). `{ "name": "...", "goal_prompt": "..." }`.
+  Unknown name → `404`.
+
+> Note: `/threads` (no suffix) is the **dashboard** read — it carries the full
+> rows incl. `goal_prompt` and the research board depends on it. `/threads/public`
+> is the separate trimmed agent feed; the two are intentionally distinct.
+
 ## Endpoints (sketch — not yet implemented)
 
 ### Compute donor
