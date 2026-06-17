@@ -171,6 +171,59 @@ def comparisons() -> list[dict]:
     return out
 
 
+def activity() -> dict:
+    """Live 'what is being worked on RIGHT NOW' snapshot for the dashboard.
+    Postgres-only (the distributed store): in-flight claims, active boxes, and
+    runs that landed in the last 30 minutes, each tagged with the contributor +
+    box so the operator can watch concurrent work stream in."""
+    if not PG_URL:
+        return {"backend": BACKEND, "note": "activity requires the postgres backend"}
+    queue = {r["status"]: r["n"]
+             for r in _pg_rows("select status, count(*) as n from queue_items group by status")}
+    in_flight = _pg_rows(
+        """select q.id, q.name, q.status, q.claimed_at,
+                  extract(epoch from (now() - q.claimed_at))::int as age_s,
+                  b.label as box, c.handle
+           from queue_items q
+           left join boxes b on b.id = q.claimed_by_box
+           left join contributors c on c.id = b.contributor_id
+           where q.status in ('claimed','running')
+           order by q.claimed_at asc nulls last""")
+    recent_runs = _pg_rows(
+        """select r.id, r.name, r.status, r.final_val_loss, r.verification,
+                  r.created_at, extract(epoch from (now() - r.created_at))::int as age_s,
+                  c.handle, b.label as box
+           from runs r
+           left join contributors c on c.id = r.contributor_id
+           left join boxes b on b.id = r.box_id
+           where r.created_at > now() - interval '30 minutes'
+           order by r.created_at desc""")
+    contributors = _pg_rows(
+        """select c.handle, c.role, count(r.id) as runs_total,
+                  count(r.id) filter (where r.created_at > now() - interval '30 minutes') as runs_recent
+           from contributors c left join runs r on r.contributor_id = c.id
+           group by c.handle, c.role
+           having count(r.id) > 0
+           order by runs_total desc""")
+    active_boxes = _pg_rows(
+        """select b.label, c.handle,
+                  count(*) filter (where q.status in ('claimed','running')) as in_flight
+           from boxes b
+           left join contributors c on c.id = b.contributor_id
+           left join queue_items q on q.claimed_by_box = b.id
+           group by b.label, c.handle
+           having count(*) filter (where q.status in ('claimed','running')) > 0
+           order by in_flight desc""")
+    return {
+        "backend": BACKEND,
+        "queue": queue,
+        "in_flight": in_flight,
+        "active_boxes": active_boxes,
+        "recent_runs": recent_runs,
+        "contributors": contributors,
+    }
+
+
 _COUNT_TABLES = ("threads", "queue_items", "runs", "eval_points",
                  "comparisons", "decisions", "ideas")
 
@@ -192,6 +245,7 @@ def health() -> dict:
 
 ROUTES = {
     "/health": health,
+    "/activity": activity,
     "/runs": runs,
     "/threads": lambda: rows("select * from threads order by priority desc"),
     "/comparisons": comparisons,

@@ -15,3 +15,6 @@ supabase/seed_from_sqlite.sql
 # secrets
 .env
 .env.local
+
+# ephemeral box run stdout
+run-logs/
