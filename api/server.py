@@ -142,9 +142,21 @@ def rows(sql_pg: str, sql_sqlite: str | None = None, params: tuple = ()) -> list
 
 def runs() -> list[dict]:
     have_eval = {r["run_id"] for r in rows("select distinct run_id from eval_points")}
+    # Stable inventor attribution: the runs table carries contributor_id, so map
+    # it to a handle here. This is what /gallery + /contributor key off — unlike
+    # the activity() snapshot it never ages out, so a run keeps its inventor
+    # forever instead of decaying to "anonymous" after 30 minutes (issue #14).
+    # Best-effort: the legacy SQLite store has no contributors table, so fall
+    # back to an empty map and every run simply reads back handle=null.
+    try:
+        handles = {c["id"]: c.get("handle")
+                   for c in rows("select id, handle from contributors")}
+    except Exception:
+        handles = {}
     raw = rows("select * from runs order by created_at desc")
     out = []
     for r in raw:
+        cid = r.get("contributor_id")
         out.append({
             "id": r["id"],
             "thread_name": r.get("thread_name"),
@@ -161,6 +173,9 @@ def runs() -> list[dict]:
             "created_at": r.get("created_at"),
             "finished_at": r.get("finished_at"),
             "has_eval": r["id"] in have_eval,
+            # Inventor identity (null-safe: a run with no contributor → both null).
+            "contributor_id": cid,
+            "contributor_handle": handles.get(cid),
         })
     return out
 
