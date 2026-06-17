@@ -193,6 +193,43 @@ def comparisons() -> list[dict]:
     return out
 
 
+def threads() -> list[dict]:
+    """Research threads for the board, enriched with two card signals:
+
+      * run_count_last_7d — how many `runs` landed under this thread in the last
+        7 days. The "is this hot" badge (🔥 N runs this week).
+      * lazy auto-release — a claim whose claim_expires_at is in the past reads
+        back as unclaimed (the three claim fields nulled in the response). The
+        row is left untouched in the DB; the next claim overwrites it. This way
+        an abandoned claim never permanently parks a thread, with no sweeper job.
+
+    Portable across both backends. The claim columns only exist on Postgres
+    (migration 0006); on the legacy SQLite store they're simply absent and the
+    expiry branch is a no-op."""
+    sql_pg = (
+        "select t.*, "
+        "(t.claim_expires_at is not null and t.claim_expires_at < now()) "
+        "  as claim_expired, "
+        "(select count(*) from runs r "
+        "   where r.thread_name = t.name "
+        "     and r.created_at > now() - interval '7 days') as run_count_last_7d "
+        "from threads t order by t.priority desc")
+    sql_sqlite = (
+        "select t.*, "
+        "(select count(*) from runs r "
+        "   where r.thread_name = t.name "
+        "     and r.created_at > datetime('now','-7 days')) as run_count_last_7d "
+        "from threads t order by t.priority desc")
+    out = []
+    for r in rows(sql_pg, sql_sqlite):
+        if r.pop("claim_expired", False):  # lazy auto-release on read
+            r["claimed_by"] = None
+            r["claimed_at"] = None
+            r["claim_expires_at"] = None
+        out.append(r)
+    return out
+
+
 def activity() -> dict:
     """Live 'what is being worked on RIGHT NOW' snapshot for the dashboard.
     Postgres-only (the distributed store): in-flight claims, active boxes, and
@@ -305,11 +342,72 @@ def upsert_thread(body: dict) -> dict:
     return out[0] if out else {}
 
 
+def claim_thread(body: dict) -> dict:
+    """Claim a thread for a contributor — an async 'I'm on this' signal so two
+    people (or two agents) don't run the same thread and waste GPU-hours. Sets a
+    48h expiry; an expired claim is treated as open (see threads()), and the
+    guard below lets a re-claim by the SAME handle extend, or anyone re-claim an
+    expired/open thread. Single-operator localhost, so the read-then-explain on
+    contention is fine — no auth (matches upsert_thread)."""
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise ValueError("thread 'name' is required")
+    claimed_by = (body.get("claimed_by") or "").strip()
+    if not claimed_by:
+        raise ValueError("'claimed_by' handle is required to claim a thread")
+    out = _pg_exec(
+        """
+        update threads set
+            claimed_by       = %(claimed_by)s,
+            claimed_at       = now(),
+            claim_expires_at = now() + interval '48 hours',
+            updated_at       = now()
+        where name = %(name)s
+          and (claimed_by is null
+               or claimed_by = %(claimed_by)s
+               or claim_expires_at < now())
+        returning *
+        """,
+        {"name": name, "claimed_by": claimed_by},
+    )
+    if out:
+        return out[0]
+    # No row updated: the thread is missing, or actively claimed by someone else.
+    existing = _pg_rows(
+        "select claimed_by, claim_expires_at from threads where name = %s", (name,))
+    if not existing:
+        raise ValueError(f"no such thread: {name}")
+    raise ValueError(f"thread already claimed by {existing[0]['claimed_by']}")
+
+
+def release_thread(body: dict) -> dict:
+    """Drop a claim, returning the thread to the open queue. Clears all three
+    claim fields."""
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise ValueError("thread 'name' is required")
+    out = _pg_exec(
+        """
+        update threads set
+            claimed_by       = null,
+            claimed_at       = null,
+            claim_expires_at = null,
+            updated_at       = now()
+        where name = %(name)s
+        returning *
+        """,
+        {"name": name},
+    )
+    if not out:
+        raise ValueError(f"no such thread: {name}")
+    return out[0]
+
+
 ROUTES = {
     "/health": health,
     "/activity": activity,
     "/runs": runs,
-    "/threads": lambda: rows("select * from threads order by priority desc"),
+    "/threads": threads,
     "/comparisons": comparisons,
     "/champions": lambda: rows("select * from champions order by promoted_at desc"),
     "/ideas": lambda: rows("select * from ideas order by created_at desc"),
@@ -328,8 +426,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802 - http.server API
-        """The only write the dashboard performs: author / update a research
-        thread. Localhost, single operator, no auth — see module docstring."""
+        """Writes the dashboard performs, all on /threads (localhost, single
+        operator, no auth — see module docstring):
+          * author / update a thread          (default)
+          * claim a thread     action=claim    (sets claimed_by + 48h expiry)
+          * release a claim    action=release  (clears the claim fields)"""
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
@@ -342,10 +443,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found", "writable": ["/threads"]})
             return
         if not PG_URL:
-            self._send(501, {"error": "thread authoring requires the Postgres backend"})
+            self._send(501, {"error": "thread writes require the Postgres backend"})
             return
+        action = (body.get("action") or "").strip().lower()
+        handler = {"claim": claim_thread, "release": release_thread}.get(
+            action, upsert_thread)
         try:
-            self._send(200, upsert_thread(body))
+            self._send(200, handler(body))
+        except ValueError as e:  # bad input / contention — client-correctable
+            self._send(400, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
             self._send(500, {"error": str(e)})
 
