@@ -1,0 +1,36 @@
+# voidbase — Supabase local/project config.
+# Run `supabase start` for a local stack, `supabase db push` to apply migrations
+# to the hosted project. project_id is the local stack name, not the cloud ref.
+project_id = "voidbase"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 15
+
+[studio]
+enabled = true
+port = 54323
+
+[auth]
+enabled = true
+# Public platform: anyone can sign up. GitHub OAuth recovers the one good thing
+# the old GitHub-transport gave us — free, trusted human identity.
+site_url = "http://localhost:3000"
+enable_signup = true
+
+[auth.external.github]
+enabled = true
+# Set client_id / secret via env (SUPABASE_AUTH_GITHUB_CLIENT_ID / _SECRET)
+# or in the hosted dashboard. Do not commit secrets here.
+client_id = ""
+secret = ""
+
+[analytics]
+enabled = false
