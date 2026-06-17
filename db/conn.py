@@ -29,6 +29,15 @@ def _load_env_file() -> dict[str, str]:
     return out
 
 
+def env_value(key: str, default: str | None = None) -> str | None:
+    """Resolve a config var from the environment, then voidbase/.env, then the
+    default. The single place box/SSH config (and any other secret) is read, so
+    nothing — credentials least of all — is ever hard-coded in source. .env is
+    gitignored, so a host/port set there never lands in a commit.
+    """
+    return os.environ.get(key) or _load_env_file().get(key) or default
+
+
 def database_url(pooled: bool = False) -> str | None:
     """The Neon connection string, or None if not configured.
 
