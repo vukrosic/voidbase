@@ -70,6 +70,36 @@ voidbase/
 └─ registry/                   # OLD SQLite system — still live, removed at cutover
 ```
 
+## Confirm daemon
+
+Confirming a screen WIN used to be a manual step — the bottleneck at 50+
+experiments/week. `scripts/confirm_daemon.py` automates the *queueing* of
+confirms (a human still promotes):
+
+1. Polls Neon for `done`, still-`unverified` runs whose `final_val_loss` beats
+   the **current champion** by more than the screen band (`0.02`).
+2. For each fresh candidate it enqueues a **paired 3-seed confirm** — 3 candidate
+   runs + 3 champion-baseline runs at matched seeds (42 / 123 / 7) — as
+   `queue_items` the worker drains. It never double-enqueues.
+3. When all 6 finish it computes the **paired delta** (candidate mean − champion
+   mean), writes one `confirmations` row, and flips the run's `verification` to
+   `confirmed` / `rejected`.
+
+The baseline arm is rebuilt from the **current champion config** (champions table
+→ its run's `config`), re-run fresh in the same batch — never the bare base and
+never a stale log, the bug that used to over-credit promotions.
+
+It does **not** promote. Promotion to champion stays a maintainer action — a
+human in the loop even at scale. `--auto-promote` exists but is a no-op stub.
+
+```bash
+python3 scripts/confirm_daemon.py --once          # one poll cycle, then exit
+python3 scripts/confirm_daemon.py --interval 60   # poll loop (default 60s)
+python3 scripts/confirm_daemon.py --once --scope tiny1m3m --screen-band 0.02
+```
+
+Needs `DATABASE_URL` (Neon) configured — see `db/conn.py`.
+
 ## Status / cutover
 
 The old `registry/` SQLite system is **still the live store** for the running
