@@ -26,6 +26,9 @@ Endpoints (GET unless noted, JSON):
   /ideas         backlog
   /queue         job queue
   /eval?run_id=  per-step learning curve for one run
+  /leaderboard   contributors ranked by the credit policy (voidcredit; PG-only)
+  /contributor?handle=  one contributor's card (voidcredit; PG-only)
+  /lineage?run=  thread→queue_item→run→champion chain (voidcredit; PG-only)
 
   POST /threads        author / update a research thread (dashboard)
   POST /box_heartbeat  {box_id, gpu_class?} liveness ping from a worker (PG-only)
@@ -46,6 +49,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from db.conn import database_url  # noqa: E402
+import voidcredit  # noqa: E402  — pure attribution/leaderboard policy (Postgres-only edges)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "registry" / "experiments.sqlite"
 
@@ -554,6 +558,77 @@ def release_thread(body: dict) -> dict:
     return out[0]
 
 
+# --- Voidcredit: attribution & leaderboard (read-only; Postgres-only) --------
+#
+# These do the aggregation SQL and hand the rows to the pure voidcredit policy —
+# mirroring how confirm_daemon passes rows to voidcheck. Credit is derived on
+# read (no stored credit table to drift). Postgres-only: the joins/filters need
+# the distributed store; the legacy SQLite backend returns an empty result.
+
+def leaderboard() -> list[dict]:
+    """Contributors ranked by the credit policy (impact first). One aggregate row
+    per contributor with at least one run."""
+    if not PG_URL:
+        return []
+    stats = _pg_rows(
+        """select c.handle, c.role,
+                  count(r.id)                                          as runs_total,
+                  count(r.id) filter (where r.verification='confirmed') as runs_confirmed,
+                  count(distinct ch.id)                                as champion_runs,
+                  c.compute_seconds, c.tokens_donated
+           from contributors c
+           left join runs r on r.contributor_id = c.id
+           left join champions ch on ch.run_id = r.id and ch.superseded_at is null
+           group by c.id, c.handle, c.role, c.compute_seconds, c.tokens_donated
+           having count(r.id) > 0""")
+    return voidcredit.rank_contributors(stats)
+
+
+def contributor(handle: str) -> dict:
+    """One contributor's card: totals, best run, champion-holding runs, recent
+    runs. Unknown handle is a 404 (client-correctable)."""
+    if not handle:
+        raise ValueError("contributor requires 'handle'")
+    if not PG_URL:
+        return {}
+    exists = _pg_rows("select 1 from contributors where handle = %s", (handle,))
+    if not exists:
+        raise ValueError(f"no such contributor: {handle}")
+    runs = _pg_rows(
+        """select r.id, r.name, r.thread_name, r.verification, r.final_val_loss,
+                  r.created_at, r.finished_at
+           from runs r join contributors c on c.id = r.contributor_id
+           where c.handle = %s order by r.created_at desc""", (handle,))
+    champ_ids = [row["run_id"] for row in
+                 _pg_rows("select run_id from champions where superseded_at is null")]
+    return voidcredit.contributor_card(handle, runs, champion_run_ids=champ_ids)
+
+
+def lineage(run_id: str) -> dict:
+    """The provenance chain for one run: thread → queue_item → run → champion."""
+    if not run_id:
+        raise ValueError("lineage requires 'run'")
+    if not PG_URL:
+        return {}
+    runs = _pg_rows("select * from runs where id = %s", (run_id,))
+    if not runs:
+        raise ValueError(f"no such run: {run_id}")
+    run = runs[0]
+    qi = None
+    if run.get("queue_item_id"):
+        qrows = _pg_rows("select id, name from queue_items where id = %s",
+                         (run["queue_item_id"],))
+        qi = qrows[0] if qrows else None
+    thread = None
+    if run.get("thread_name"):
+        trows = _pg_rows("select name, hypothesis from threads where name = %s",
+                         (run["thread_name"],))
+        thread = trows[0] if trows else None
+    champs = _pg_rows("select run_id, scope, promoted_at, superseded_at "
+                      "from champions where run_id = %s", (run_id,))
+    return voidcredit.run_lineage(run, queue_item=qi, thread=thread, champions=champs)
+
+
 # --- Voidrunner: auth + the compute-donor write protocol --------------------
 #
 # These four handlers are the server side of the compute-donor client
@@ -790,6 +865,7 @@ ROUTES = {
     "/champions": lambda: rows("select * from champions order by promoted_at desc"),
     "/ideas": lambda: rows("select * from ideas order by created_at desc"),
     "/queue": lambda: rows("select * from queue_items order by created_at desc"),
+    "/leaderboard": leaderboard,
 }
 
 
@@ -902,10 +978,17 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/threads/goal":
                 self._send(200, thread_goal(q.get("name", [""])[0]))
                 return
+            if path == "/contributor":
+                self._send(200, contributor(q.get("handle", [""])[0]))
+                return
+            if path == "/lineage":
+                self._send(200, lineage(q.get("run", [""])[0]))
+                return
             handler = ROUTES.get(path)
             if handler is None:
                 routes = sorted([*ROUTES, "/eval?run_id=",
-                                 "/threads/public?status=&unclaimed=", "/threads/goal?name="])
+                                 "/threads/public?status=&unclaimed=", "/threads/goal?name=",
+                                 "/contributor?handle=", "/lineage?run="])
                 self._send(404, {"error": "not found", "routes": routes})
                 return
             self._send(200, handler())
