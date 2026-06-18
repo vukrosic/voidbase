@@ -23,8 +23,16 @@ create table if not exists contributors (
                         check (role in ('contributor', 'maintainer')),
     compute_seconds bigint not null default 0,
     tokens_donated  bigint not null default 0,
+    -- Bearer-token auth (0009): sha256(token) hex. Plaintext shown once at
+    -- /register, never stored. Null for token-less identities (e.g. the
+    -- localhost 'automation' contributor, which uses the dev bypass).
+    token_hash      text,
     created_at      timestamptz not null default now()
 );
+
+create unique index if not exists contributors_token_hash_key
+    on contributors (token_hash)
+    where token_hash is not null;
 
 create table if not exists boxes (
     id               uuid primary key default gen_random_uuid(),

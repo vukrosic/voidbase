@@ -18,3 +18,5 @@ supabase/seed_from_sqlite.sql
 
 # ephemeral box run stdout
 run-logs/
+# voidrunner: a donor's local run stdout (default VOIDRUNNER_LOG_DIR)
+voidrunner-logs/
