@@ -7,6 +7,61 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Config-drift ROOT-CAUSE FIX + real pipeline armed (16 faithful jobs queued)
+
+**The big win: the config-drift bug is fixed at the root, and the proper automated
+pipeline is now armed with registry-faithful jobs.**
+
+1. **Drift fix.** The box had no `autoresearch/champion.json`, so `run_experiment.py`
+   built on a BARE config (the 6.2556 mystery two fires ago) and delta configs were
+   unfaithful. Copied the Mac's authoritative champion.json (the same one the feeder
+   reads) to `/root/universe-lm/autoresearch/champion.json`. Verified: a bare delta
+   `{use_swiglu_ffn:true}` now resolves to the FULL champion base (muon_lr 0.048,
+   muon_momentum 0.9, use_deepnet_alpha, use_poly_alibi + alibi env) + the flag. So
+   delta-config runs are now registry-faithful — the 0.019 drift is gone at the source.
+2. **`.env` box coords ARE valid** (my earlier "empty" read was a bad raw grep;
+   `db.conn.env_value` returns the right host/port/user/repo/python). So `worker.py`
+   can reach the box — the pipeline is wired.
+3. **Armed the queue.** Ran `feeder.py --limit 16 --priority 5`: enqueued 16 untried
+   structural flags as registry-faithful `needs-run` jobs (champion+flag, deduped vs
+   62 already-tried). The queue went from 0 → 16 needs-run. These are ready for
+   `worker.py` to drain on the box and report to Neon — the proper, automated,
+   registry-faithful path (vs my hand-run sweep).
+
+**Hand-sweep results (continuing, within-session deltas vs baseline 6.1778):**
+- `use_swiglu_ffn` 6.1650 → **+0.0128 (clears band — the lead holds)**
+- `use_value_residual` 6.1800 → −0.0022 (slightly WORSE; negative result, drop it)
+- qk_layernorm/parallel_block/sub_ln/v_rmsnorm/head_gain still running (~30 min).
+
+**Self-critique**
+- *I should have copied champion.json to the box the moment I found it missing two
+  fires ago* instead of hand-passing full configs as a workaround. The root-cause
+  fix is one scp; I deferred it and paid in confusion (the 6.2556 run, the 0.019
+  drift analysis). Fix the root, not the symptom.
+- *GPU contention is the real constraint now.* One box, and my hand-sweep is using
+  it, so I couldn't start the worker this fire (two GPU loads on 12 GB = OOM risk).
+  This is why I queued the jobs but deferred the drain. A second box would let the
+  proper pipeline run while the hand-sweep finishes — but that's a rental decision
+  for the human, not an autonomous one.
+- *The hand-sweep is now redundant with the pipeline* (both test untried flags), but
+  it tests a DIFFERENT 7 flags than the feeder's 16, so killing it would lose those
+  datapoints — I let it finish. Going forward, ONLY the feeder→worker path (no more
+  hand-runs): it's faithful, deduped, automated, and reports to the registry.
+- *Didn't start confirm_daemon/reaper.* The full loop is 4 daemons; I've only armed
+  the queue. Starting worker+confirm+reaper is the next fire's job.
+
+**Next moves (priority order)**
+1. **Start `worker.py loop`** once the hand-sweep finishes (GPU free) — drains the 16
+   faithful jobs on the box, reports to Neon. Its heartbeats also revive the box's
+   ONLINE status on the dashboard (fixing the stale-offline display). THE core loop.
+2. **Enqueue swiglu_ffn + the band-clearing sweep flags via the feeder** so the lead
+   gets a registry-faithful run + (via confirm_daemon) a real 3-seed paired confirm.
+   swiglu at +0.0128 is the first genuine champion challenger in this search.
+3. **Start confirm_daemon + reaper** to close the loop (judge confirms, self-heal).
+4. **psycopg_pool**; freshness already shipped.
+
+---
+
 ## 2026-06-19 · Freshness badge + UNTRIED-flag discovery (search not exhausted) + paired sweep
 
 **Two things this fire: a small UI ship, and a research correction.**
