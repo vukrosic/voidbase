@@ -45,6 +45,7 @@ import secrets
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -725,6 +726,57 @@ def gate(scope: str) -> dict:
             "recent_verdicts": recent_verdicts}
 
 
+# --- Composite dashboard endpoint (one round-trip + short TTL cache) ---------
+#
+# The voidspark dashboard needs six things at once: health, the champion
+# lineage, the confirm gate, recent runs, comparisons, and live activity.
+# Fetched separately that is six slow Neon round-trips PER POLL from every open
+# tab — and because the whole backend shares one connection behind `_pg_lock`
+# (see _pg_rows), those round-trips serialize, so concurrent pollers pile up and
+# the page hangs. /dashboard composes them server-side into one payload and
+# memoizes it for a few seconds: N polling clients then cost at most ONE DB pass
+# per TTL window instead of 6·N. A cache hit returns without ever taking the
+# lock, so it cannot contend with live writes.
+_DASH_CACHE: dict[str, tuple[float, dict]] = {}
+_DASH_CACHE_LOCK = threading.Lock()
+# The composite query itself takes ~10–13s against a distant Neon region, so the
+# TTL must comfortably exceed that — otherwise a snapshot expires before a second
+# poll can ever reuse it. 12s keeps concurrent tabs + the page/gate pollers off
+# the DB while staying fresher than the ~6.5-min cadence at which runs land.
+_DASH_TTL_S = 12.0
+
+
+def dashboard(scope: str) -> dict:
+    scope = scope or "tiny1m3m"
+    with _DASH_CACHE_LOCK:
+        hit = _DASH_CACHE.get(scope)
+        if hit is not None and time.monotonic() - hit[0] < _DASH_TTL_S:
+            # Serve the memoized snapshot; mark it so the client/operator can see
+            # this poll did not hit the database.
+            return {**hit[1], "cached": True}
+    # Miss: do the (serialized) DB work once, then publish for the TTL window.
+    payload = {
+        "scope": scope,
+        "health": health(),
+        "champions": rows(
+            "select * from champions where scope=%s order by promoted_at desc",
+            "select * from champions where scope=? order by promoted_at desc",
+            (scope,),
+        ),
+        "gate": gate(scope),
+        "runs": runs(),
+        "comparisons": comparisons(),
+        "activity": activity(),
+        "cached": False,
+    }
+    # Stamp the cache when the data becomes AVAILABLE (after the slow work), not
+    # when the request began — the TTL window must start now, or a 13s query
+    # would publish an already-expired entry.
+    with _DASH_CACHE_LOCK:
+        _DASH_CACHE[scope] = (time.monotonic(), payload)
+    return payload
+
+
 # --- Voidrunner: auth + the compute-donor write protocol --------------------
 #
 # These four handlers are the server side of the compute-donor client
@@ -1167,11 +1219,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/gate":
                 self._send(200, gate(q.get("scope", [""])[0]))
                 return
+            if path == "/dashboard":
+                self._send(200, dashboard(q.get("scope", [""])[0]))
+                return
             handler = ROUTES.get(path)
             if handler is None:
                 routes = sorted([*ROUTES, "/eval?run_id=",
                                  "/threads/public?status=&unclaimed=", "/threads/goal?name=",
-                                 "/contributor?handle=", "/lineage?run=", "/gate?scope="])
+                                 "/contributor?handle=", "/lineage?run=", "/gate?scope=",
+                                 "/dashboard?scope="])
                 self._send(404, {"error": "not found", "routes": routes})
                 return
             self._send(200, handler())
