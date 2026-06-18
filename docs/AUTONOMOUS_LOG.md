@@ -7,6 +7,65 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Voidmind outcome-aware proposer (the ceiling-raiser)
+
+**Shipped** — voidbase `fb1ad6f`. The idea engine was proposing BLIND: its
+`build_context` fed the donor's LLM only the goal + a flat list of lever *names*
+tried — never which won, lost, or by how much. That's the flat-search ceiling in
+software form (random recombination of the same flags). Fixed by assembling the
+**outcome signal** from data already in the API and rendering it in the prompt:
+- `champion` (GET /gate) — the val_loss every margin is measured against.
+- `lineage` (GET /champions) — the confirmed promotion arc + mechanism `reason`s;
+  the compounding story to EXTEND.
+- `frontier` — gate-cleared candidates already past the band, to build on.
+- `contenders` — best runs ranked by val_loss + signed margins (`rank_contenders`,
+  pure/unit-tested); the near-misses worth COMBINING.
+- `verdicts` — recent confirmed/rejected paired outcomes (proven / dead).
+The system prompt now tells the LLM to extend the arc / combine the strongest
+contenders / open a new direction when near-misses plateau, and never re-propose a
+rejected lever.
+
+**Tested** — `rank_contenders` + enriched `build_context` + landscape prompt are
+unit-tested with a fake transport (+6 tests; file 19, suite 79, all green; the
+original 13 unchanged since the new context keys are additive). Then exercised
+against the LIVE registry (champion 6.172): the rendered prompt correctly shows
+the 6-step arc, the real frontier `canon_conv+cross_block_score_share` (+0.0176),
+the ranked contenders with margins, and the rejected `gmlp_sgu`.
+
+**Self-critique**
+- *No UI surface, so no Chrome test this fire.* This is backend/CLI; the rigorous
+  equivalent (live `build_context` → prompt render on real data) was done. A real
+  follow-up: surface the *proposals* on voidspark so a human can watch the idea
+  engine reason — that WOULD be Chrome-testable and closes the research loop
+  visually.
+- *Live testing caught a real defect:* the tried-levers list was bloated with 16
+  `confirm-*` paired-seed machinery rows — fixed (filtered). Exactly why testing
+  on real data, not just fakes, matters. But it also means the fake-transport
+  tests alone would NOT have caught it; I should add a fixture with confirm-* rows
+  to lock the filter in. (Did add the filter test to `rank_contenders`; the
+  `tried_levers` filter is only covered live — a gap.)
+- *The proposer is still only as good as the donor's LLM + the flags it knows.*
+  The landscape tells it WHAT compounded, but the config schema (`fields`) is the
+  vocabulary ceiling — it can only propose flags `run_experiment.py` understands.
+  A genuinely novel *mechanism* (new code path, not a flag toggle) still needs a
+  human or a code-writing agent. This raises the recombination ceiling, not the
+  invention one.
+- *Unverifiable end-to-end right now:* the GPU box is offline, so even a brilliant
+  proposal can't be run to confirm the landscape-reasoning actually finds a >band
+  winner. The logic is tested; the *research payoff* is blocked on compute.
+
+**Next moves (priority order)**
+1. **Surface proposals/ideas on voidspark** — the idea engine now reasons well but
+   is invisible. A panel showing recent proposals (lever + the landscape signal
+   that motivated them) makes the research loop watchable AND Chrome-testable.
+2. **Lock the `confirm-*` tried-levers filter in a unit test** (critique #2 gap).
+3. **Per-run lineage breadcrumb** in the runs expand row (`/lineage?run=`) — the
+   five-fires-deferred cheap UI win.
+4. **Get a GPU box back** so the proposer's output can actually be confirmed —
+   the research payoff is compute-blocked (box offline since 2026-06-18 13:34).
+
+---
+
 ## 2026-06-19 · Split api/server.py god-file (4 modules)
 
 **Shipped** — voidbase `e4acd44`. The 1252-line `api/server.py` (DB plumbing +
