@@ -7,6 +7,65 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Freshness badge + UNTRIED-flag discovery (search not exhausted) + paired sweep
+
+**Two things this fire: a small UI ship, and a research correction.**
+
+**Shipped (UI)** — voidspark `f6e7bc3`. Freshness badge on `/voidbase` surfacing
+the `stale`/`age_s` the SWR cache already returns: green "live"/"Ns old" when
+fresh, amber "Ns old · refreshing" when serving a stale snapshot mid-refresh.
+Makes last fire's invisible caching honest. Tested in Chrome (showed "17s old ·
+refreshing" amber), zero console errors.
+
+**Research correction — the search is NOT exhausted.** The standing belief
+(memory + logs) was that singles plateaued and the space is mined out. False:
+`llm_config.py` defines **177 `use_*` flags; only 37 have ever been tried**.
+Excluding optimizer/LR variants (rules: structural only) leaves **115 UNTRIED
+structural mechanisms** — many literature-strong and obviously worth trying:
+`use_swiglu_ffn`, `use_value_residual`, `use_qk_layernorm`, `use_parallel_block`,
+`use_sub_ln`, `use_mla`, `use_sliding_window`, `use_short_conv`, `use_xpos`,
+`use_softpick`, `use_nope`, etc. The "plateau" was a plateau of the 37 tried, not
+of the space. This reframes the whole "search needs a better idea" conclusion:
+there ARE untested ideas, sitting right in the config.
+
+**In progress (GPU)** — launched a faithful paired sweep on the box (still up,
+RTX 3060): baseline (champion) + 7 untried structural flags (champion + each),
+seed 42, same session so within-session deltas are clean. All 7 dry-validated
+(DRY_OK). Running unattended in tmux (`/root/sweep.log`, ~40 min for 8 runs);
+results land one per run. NEXT fire should read `/root/sweep.log` for the deltas
+— any candidate beating baseline by > 0.01 (the band) is a real new lead.
+
+**Self-critique**
+- *I asserted "search plateaued" for several fires without ever enumerating the
+  untried space.* A 30-second `grep use_ | sort -u` vs the tried set would have
+  shown 115 untried mechanisms days ago. I trusted the inherited conclusion instead
+  of checking it — the exact failure the outcome-aware proposer was meant to fix,
+  committed by me at the meta level. Lesson: re-derive "we're stuck" claims from
+  data before accepting them.
+- *Same drift caveat as last fire:* these are hand-built configs (champion base +
+  one flag), so absolute numbers won't match the registry and I'm NOT writing them
+  to Neon. Only the within-session baseline-vs-candidate deltas are trustworthy.
+  The proper path is still the worker/queue pipeline (logged below).
+- *The sweep script captures each run's full output and only logs the final*, so I
+  can't watch step-level progress — a `tee` to a per-run file would let me catch a
+  diverging run early instead of waiting ~5 min per result. Minor.
+- *7 flags is a thin slice of 115.* Picked by literature priors, not systematically.
+  A real campaign would batch many more (the box is free), but I bounded it to keep
+  the fire reviewable and the GPU spend sane.
+
+**Next moves (priority order)**
+1. **Read `/root/sweep.log`** and record the 7 deltas; promote any >band lead into
+   a proper registry confirm (worker pipeline).
+2. **Wire the untried-flag sweep into the real loop** — `feeder.py` already enqueues
+   untried `use_*` singles (deduped); point it at the 115 and let `worker.py` drain
+   them so results are registry-faithful, not hand-run. THIS is how to mine the
+   space properly.
+3. **Run the frontier candidate through the real pipeline** (last fire's #1, still
+   valid) to settle its sub-band result registry-cleanly.
+4. **Revive the box heartbeat**; **psycopg_pool**.
+
+---
+
 ## 2026-06-19 · GPU box revived → REAL paired research run (frontier candidate likely noise)
 
 **First compute fire in days — and it produced a real research finding, not code.**
