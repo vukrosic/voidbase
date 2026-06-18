@@ -42,8 +42,10 @@ from db.conn import connect  # noqa: E402
 # do `from scripts.confirm_daemon import SEEDS, paired_verdict`) keep working.
 from voidcheck import (  # noqa: E402,F401
     CONFIRM_BAND,
+    MAX_DROP_FACTOR,
     SCREEN_BAND,
     SEEDS,
+    is_implausible_win,
     paired_verdict,
 )
 
@@ -249,15 +251,28 @@ def poll_cycle(conn, args, contributor_id: str) -> dict:
     champ = current_champion(conn, args.scope)
     if champ is None:
         log(f"no current champion for scope '{args.scope}' — nothing to confirm")
-        return {"candidates": 0, "enqueued": 0, "judged": 0}
+        return {"candidates": 0, "enqueued": 0, "judged": 0, "skipped_implausible": 0}
     if champ["config"] is None:
         log(f"champion run {champ['run_id']} has no config — cannot build a "
             f"baseline arm without falling back to the bare base; skipping cycle")
-        return {"candidates": 0, "enqueued": 0, "judged": 0}
+        return {"candidates": 0, "enqueued": 0, "judged": 0, "skipped_implausible": 0}
 
     cand = candidates(conn, champ["val_loss"], args.screen_band)
-    enqueued, judged = 0, 0
+    enqueued, judged, skipped_implausible = 0, 0, 0
     for c in cand:
+        # "Too good to be true" floor: a broken or forged nonsense-low val_loss
+        # screens as the BIGGEST win and would otherwise burn a 6-run paired
+        # confirm on garbage. Skip it (non-destructively — the run is left
+        # untouched for a human to inspect/reject) and keep going; the real
+        # candidates after it still get confirmed. This is the confirm-side guard
+        # for the new untrusted-donor /runs path.
+        if is_implausible_win(c["final_val_loss"], champ["val_loss"], args.max_drop_factor):
+            skipped_implausible += 1
+            log(f"SKIP implausible candidate {c['id']} "
+                f"(val {c['final_val_loss']:.4f} vs champ {champ['val_loss']:.4f} — "
+                f"more than {1 - args.max_drop_factor:.0%} better; likely broken metric "
+                f"or forged report, NOT auto-confirming; needs human review)")
+            continue
         jobs = confirm_jobs(conn, c["id"])
         if not jobs:
             # Phase A: no confirm in flight yet — enqueue the paired 6.
@@ -284,7 +299,8 @@ def poll_cycle(conn, args, contributor_id: str) -> dict:
         log("--auto-promote is a stub and does nothing — promotion stays a "
             "maintainer action")
 
-    return {"candidates": len(cand), "enqueued": enqueued, "judged": judged}
+    return {"candidates": len(cand), "enqueued": enqueued, "judged": judged,
+            "skipped_implausible": skipped_implausible}
 
 
 # --- entry -------------------------------------------------------------------
@@ -301,6 +317,10 @@ def main() -> int:
                     help=f"candidate must beat champion by more than this (default {SCREEN_BAND})")
     ap.add_argument("--confirm-band", type=float, default=CONFIRM_BAND,
                     help=f"paired-mean epsilon for AGREE (default {CONFIRM_BAND})")
+    ap.add_argument("--max-drop-factor", type=float, default=MAX_DROP_FACTOR,
+                    help=("skip candidates below this fraction of the champion val_loss "
+                          f"as too-good-to-be-true (default {MAX_DROP_FACTOR}; broken/"
+                          "forged metrics never auto-consume confirm GPU)"))
     ap.add_argument("--priority", type=int, default=100,
                     help="queue priority for confirm jobs (default 100 — ahead of search)")
     ap.add_argument("--auto-promote", action="store_true",
@@ -318,7 +338,7 @@ def main() -> int:
     if args.once:
         s = cycle()
         log(f"once: {s['candidates']} candidate(s), enqueued {s['enqueued']}, "
-            f"judged {s['judged']}")
+            f"judged {s['judged']}, skipped-implausible {s['skipped_implausible']}")
         return 0
 
     log(f"confirm daemon: scope={args.scope} screen-band={args.screen_band} "
@@ -326,9 +346,9 @@ def main() -> int:
     while True:
         try:
             s = cycle()
-            if s["enqueued"] or s["judged"]:
+            if s["enqueued"] or s["judged"] or s["skipped_implausible"]:
                 log(f"cycle: {s['candidates']} candidate(s), enqueued {s['enqueued']}, "
-                    f"judged {s['judged']}")
+                    f"judged {s['judged']}, skipped-implausible {s['skipped_implausible']}")
             time.sleep(args.interval)
         except KeyboardInterrupt:
             log("stopped")

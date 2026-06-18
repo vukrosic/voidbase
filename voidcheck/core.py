@@ -22,6 +22,17 @@ SCREEN_BAND = 0.02
 # paired same-batch design + 3/3 sign agreement is the noise floor, not a band.
 CONFIRM_BAND = 0.001
 
+# Plausibility floor: the screen rewards a LOWER val_loss, but it has no lower
+# bound — so a broken run that prints a nonsense-low loss (a crash mis-parsed as a
+# metric, a truncated eval, or a forged report from an untrusted donor box) looks
+# like the BIGGEST win and becomes the #1 confirm candidate, burning a 6-run
+# paired confirm on garbage. A single structural experiment does not more than
+# halve val_loss in this regime; a candidate below this fraction of the champion
+# is "too good to be true" and must not auto-consume confirm GPU. Conservative on
+# purpose — a genuine win is single-digit-percent, so the real candidates clear it
+# with huge margin; only the physically-impossible get flagged.
+MAX_DROP_FACTOR = 0.5
+
 
 def is_paired(seed, box_id, baseline_seed, baseline_box_id) -> bool:
     """Mirror of the comparisons.is_paired GENERATED column: a delta is trustworthy
@@ -45,6 +56,27 @@ def beats_screen(candidate_val, champion_val, band: float = SCREEN_BAND) -> bool
     if candidate_val is None or champion_val is None:
         return False
     return (champion_val - candidate_val) > band
+
+
+def is_implausible_win(candidate_val, champion_val,
+                       max_drop_factor: float = MAX_DROP_FACTOR) -> bool:
+    """True iff a candidate's screen value is "too good to be true" and should NOT
+    auto-trigger a paired confirm — a broken/forged metric, not a real result.
+
+    A val_loss at or below zero is definitionally broken (cross-entropy is > 0). A
+    value below `max_drop_factor` × the champion is an improvement too large to
+    believe from one experiment (default: more than halving the loss). When either
+    value is missing, or the champion is itself non-positive, we cannot assess
+    plausibility and DON'T flag — the screen's own None-handling and the human stay
+    responsible there. This guards the confirm queue against the new attack surface
+    opened by untrusted-donor `/runs` reports without touching the win definition."""
+    if candidate_val is None or champion_val is None:
+        return False
+    if candidate_val <= 0:
+        return True
+    if champion_val <= 0:
+        return False
+    return candidate_val < champion_val * max_drop_factor
 
 
 def paired_verdict(jobs: list[dict], confirm_band: float = CONFIRM_BAND,
