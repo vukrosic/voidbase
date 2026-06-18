@@ -492,6 +492,11 @@ def dashboard(scope: str) -> dict:
         "runs": runs(),
         "comparisons": comparisons(),
         "activity": activity(),
+        # Recent idea backlog — the proposal stream (Voidmind + manual). Ideas are
+        # not scope-keyed, so this is a global recent slice; the dashboard renders
+        # it as the "what is the search thinking about" panel. Capped so the payload
+        # stays small (the full backlog is /ideas).
+        "ideas": rows("select * from ideas order by created_at desc limit 24"),
         "cached": False,
     }
     # Stamp the cache when the data becomes AVAILABLE (after the slow work), not
