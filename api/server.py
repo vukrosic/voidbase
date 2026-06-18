@@ -54,6 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from db.conn import database_url  # noqa: E402
 import voidcredit  # noqa: E402  — pure attribution/leaderboard policy (Postgres-only edges)
 import voidconfig  # noqa: E402  — pure config-row shape + authoritative dedup hash (Voidmind writes)
+import voidcheck   # noqa: E402  — pure trust rules (the screen band + plausibility floor; single source)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "registry" / "experiments.sqlite"
 
@@ -633,6 +634,64 @@ def lineage(run_id: str) -> dict:
     return voidcredit.run_lineage(run, queue_item=qi, thread=thread, champions=champs)
 
 
+def gate(scope: str) -> dict:
+    """Read-only status of the confirm gate for a scope: the live champion, the
+    candidate field (runs that CLEAR the screen band vs the closest sub-band
+    near-miss), and the SINGLE blocker keeping the gate from promoting. Surfaces in
+    one HTTP call what the confirm daemon only logs, so the dashboard can show WHY
+    the champion is or isn't moving. Band + plausibility come from voidcheck (the
+    single source), so this can never disagree with the daemon's own judgement."""
+    scope = scope or "tiny1m3m"
+    if not PG_URL:
+        return {}
+    champs = _pg_rows(
+        "select c.run_id, c.val_loss, (r.config is not null) as has_config "
+        "from champions c join runs r on r.id = c.run_id "
+        "where c.scope = %s and c.superseded_at is null "
+        "order by c.promoted_at desc limit 1", (scope,))
+    if not champs:
+        return {"scope": scope, "screen_band": voidcheck.SCREEN_BAND, "champion": None,
+                "clears": [], "near_miss": None,
+                "blocker": "no champion set for this scope"}
+    champ = champs[0]
+    champ_val = champ["val_loss"]
+    # Same population + scoping the confirm daemon's candidates() judges.
+    field = _pg_rows(
+        "select r.id, r.name, r.final_val_loss from runs r "
+        "where r.thread_name = %s and r.status = 'done' and r.verification = 'unverified' "
+        "and r.final_val_loss is not null and r.final_val_loss < %s "
+        "and (r.queue_item_id is null or r.queue_item_id not like 'confirm-%%') "
+        "and not exists (select 1 from confirmations cf where cf.run_id = r.id) "
+        "order by r.final_val_loss asc", (scope, champ_val))
+    clears: list[dict] = []
+    near_miss: dict | None = None
+    for row in field:
+        v = row["final_val_loss"]
+        if voidcheck.is_implausible_win(v, champ_val):
+            continue  # too-good-to-be-true (broken/forged) — not a real candidate
+        entry = {"id": row["id"], "name": row["name"], "val_loss": v,
+                 "margin": round(champ_val - v, 4)}
+        if voidcheck.beats_screen(v, champ_val):
+            clears.append(entry)
+        elif near_miss is None:
+            near_miss = entry  # rows are val-ascending, so the first sub-band is closest
+    # Exactly one blocker, in priority order — what to fix to make the gate move.
+    if clears and not champ["has_config"]:
+        blocker = ("champion run has no config — cannot build the baseline arm; point "
+                   "the champion at a config-carrying run to unblock")
+    elif clears:
+        blocker = None  # gate is live: these candidates are confirmable right now
+    elif near_miss is not None:
+        blocker = (f"search plateaued — closest ({near_miss['name']}, +{near_miss['margin']}) "
+                   f"is inside the {voidcheck.SCREEN_BAND} screen band; needs a better idea")
+    else:
+        blocker = "no contender — no plausible run beats the champion yet"
+    return {"scope": scope, "screen_band": voidcheck.SCREEN_BAND,
+            "champion": {"run_id": champ["run_id"], "val_loss": champ_val,
+                         "has_config": champ["has_config"]},
+            "clears": clears, "near_miss": near_miss, "blocker": blocker}
+
+
 # --- Voidrunner: auth + the compute-donor write protocol --------------------
 #
 # These four handlers are the server side of the compute-donor client
@@ -1072,11 +1131,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/lineage":
                 self._send(200, lineage(q.get("run", [""])[0]))
                 return
+            if path == "/gate":
+                self._send(200, gate(q.get("scope", [""])[0]))
+                return
             handler = ROUTES.get(path)
             if handler is None:
                 routes = sorted([*ROUTES, "/eval?run_id=",
                                  "/threads/public?status=&unclaimed=", "/threads/goal?name=",
-                                 "/contributor?handle=", "/lineage?run="])
+                                 "/contributor?handle=", "/lineage?run=", "/gate?scope="])
                 self._send(404, {"error": "not found", "routes": routes})
                 return
             self._send(200, handler())
