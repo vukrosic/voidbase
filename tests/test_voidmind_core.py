@@ -19,7 +19,9 @@ sys.path.insert(0, str(ROOT))
 
 import voidconfig  # noqa: E402
 from voidmind import core  # noqa: E402
-from voidmind.propose import _extract_json_array, static_proposer  # noqa: E402
+from voidmind.propose import (  # noqa: E402
+    _build_prompt, _extract_json_array, static_proposer,
+)
 
 
 BASE = {
@@ -143,6 +145,140 @@ class RunOnceTest(unittest.TestCase):
         results = core.run_once("http://x", "tok", "t", None, proposer)
         self.assertIn("error", results[0])
         self.assertEqual([p for p, _, _ in fake.posts], [])
+
+
+class RankContendersTest(unittest.TestCase):
+    """The pure fitness-landscape distiller: best runs by val_loss, signed margin,
+    confirm-machinery + failed rows filtered out."""
+
+    RUNS = [
+        {"name": "lever-good", "final_val_loss": 6.150, "status": "done",
+         "verification": "unverified"},
+        {"name": "lever-best", "final_val_loss": 6.140, "status": "done",
+         "verification": "confirmed"},
+        {"name": "lever-bad", "final_val_loss": 6.300, "status": "done",
+         "verification": "unverified"},
+        {"name": "lever-broke", "final_val_loss": None, "status": "failed",
+         "verification": "unverified"},
+        {"name": "confirm-foo-cand-s7", "final_val_loss": 6.10, "status": "done",
+         "verification": "unverified"},
+    ]
+
+    def test_ranks_by_val_loss_with_margin(self):
+        out = core.rank_contenders(self.RUNS, champion_val=6.172, top=8)
+        names = [c["name"] for c in out]
+        # best (lowest val) first; failed + confirm-* dropped.
+        self.assertEqual(names, ["lever-best", "lever-good", "lever-bad"])
+        self.assertAlmostEqual(out[0]["margin"], 0.032, places=4)  # beats champion
+        self.assertAlmostEqual(out[2]["margin"], -0.128, places=4)  # worse
+
+    def test_top_caps_length(self):
+        out = core.rank_contenders(self.RUNS, champion_val=6.172, top=1)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["name"], "lever-best")
+
+    def test_no_champion_val_leaves_margin_none(self):
+        out = core.rank_contenders(self.RUNS, champion_val=None)
+        self.assertTrue(all(c["margin"] is None for c in out))
+
+
+class _OutcomeTransport:
+    """A read-only fake that answers /gate + /champions so build_context can
+    assemble the full outcome signal without a live API."""
+
+    def __init__(self):
+        self.runs = [
+            {"name": "use_x", "thread_name": "t", "final_val_loss": 6.16,
+             "status": "done", "verification": "unverified"},
+            {"name": "use_y", "thread_name": "t", "final_val_loss": 6.30,
+             "status": "done", "verification": "unverified"},
+        ]
+
+    def __call__(self, api, path, *, method, body=None, token=None, timeout=30):
+        if path.startswith("/threads/goal"):
+            return {"name": "t", "goal_prompt": "lower val_loss"}
+        if path == "/runs":
+            return self.runs
+        if path.startswith("/gate"):
+            return {
+                "scope": "t",
+                "champion": {"run_id": "champ-1", "val_loss": 6.172},
+                "clears": [{"name": "use_combo", "val_loss": 6.15, "margin": 0.022}],
+                "near_miss": None,
+                "recent_verdicts": [
+                    {"name": "use_bad", "run_id": "r9", "agrees": False, "delta": 0.002},
+                    {"name": "use_x", "run_id": "r8", "agrees": True, "delta": -0.01},
+                ],
+            }
+        if path == "/champions":
+            return [
+                {"scope": "t", "val_loss": 6.24, "reason": "alibi slopes. detail",
+                 "promoted_at": "2026-06-15"},
+                {"scope": "t", "val_loss": 6.17, "reason": "momentum. detail",
+                 "promoted_at": "2026-06-17"},
+                {"scope": "other", "val_loss": 9.0, "reason": "noise",
+                 "promoted_at": "2026-06-10"},
+            ]
+        return []
+
+
+class BuildContextOutcomeTest(unittest.TestCase):
+    def setUp(self):
+        self._orig = core._request
+        core._request = _OutcomeTransport()
+
+    def tearDown(self):
+        core._request = self._orig
+
+    def test_context_carries_fitness_landscape(self):
+        ctx = core.build_context("http://x", "t")
+        self.assertEqual(ctx["champion"]["val_loss"], 6.172)
+        self.assertEqual([c["name"] for c in ctx["frontier"]], ["use_combo"])
+        # contenders ranked best-first, with margins vs the champion
+        self.assertEqual([c["name"] for c in ctx["contenders"]], ["use_x", "use_y"])
+        self.assertAlmostEqual(ctx["contenders"][0]["margin"], 0.012, places=4)
+        # lineage scoped to this thread + oldest-first
+        self.assertEqual([round(c["val_loss"], 2) for c in ctx["lineage"]], [6.24, 6.17])
+        self.assertEqual(len(ctx["verdicts"]), 2)
+
+    def test_prompt_renders_landscape_sections(self):
+        ctx = core.build_context("http://x", "t")
+        ctx["base"] = BASE
+        prompt = _build_prompt(ctx, n=3)
+        self.assertIn("Confirmed promotion arc", prompt)
+        self.assertIn("Frontier", prompt)
+        self.assertIn("Ranked contenders", prompt)
+        self.assertIn("Recently REJECTED", prompt)
+        self.assertIn("use_bad", prompt)        # the rejected lever is named
+        # the rejected LINE names only the disagreeing lever, not the confirmed one
+        rejected_line = next(ln for ln in prompt.splitlines() if "do not "
+                             "re-propose" in ln)
+        self.assertIn("use_bad", rejected_line)
+        self.assertNotIn("use_x", rejected_line)
+
+
+class BuildContextDegradesTest(unittest.TestCase):
+    """A backend without the gate (older API) must still yield a usable context —
+    the outcome fields just come back empty, the loop keeps working."""
+
+    def setUp(self):
+        self._orig = core._request
+        core._request = _FakeTransport(tried_runs=[
+            {"name": "use_a", "thread_name": "t", "final_val_loss": 6.1,
+             "status": "done"}])
+
+    def tearDown(self):
+        core._request = self._orig
+
+    def test_no_gate_no_champions_degrades_cleanly(self):
+        ctx = core.build_context("http://x", "t")
+        self.assertIsNone(ctx["champion"])
+        self.assertEqual(ctx["frontier"], [])
+        self.assertEqual(ctx["lineage"], [])
+        self.assertEqual(ctx["verdicts"], [])
+        # contenders still rank from runs, margin None without a champion val
+        self.assertEqual([c["name"] for c in ctx["contenders"]], ["use_a"])
+        self.assertIsNone(ctx["contenders"][0]["margin"])
 
 
 class ExtractJsonArrayTest(unittest.TestCase):

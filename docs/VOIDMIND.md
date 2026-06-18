@@ -49,6 +49,11 @@ Voidmind speaks only the voidbase API. It never touches the DB.
 - `GET /threads/goal?name=…` — pull the full goal prompt for a thread (exists).
 - `GET /runs`, `GET /comparisons` — read what's already been tried, so the loop
   doesn't re-propose a dead end.
+- `GET /gate?scope=…`, `GET /champions` — read the **outcome signal** (the
+  fitness landscape): the champion + band-clearing frontier + recent verdicts, and
+  the confirmed promotion arc with mechanism reasons. `build_context` folds these
+  into the proposer prompt so it EXTENDS what compounded and COMBINES the ranked
+  near-misses, instead of proposing blind to results.
 - `POST /ideas` — write a candidate idea (**needs building**).
 - `POST /queue_items` — enqueue the idea as a runnable job, carrying a
   self-contained `config` + `content_hash` (**needs building**; the config shape
@@ -58,8 +63,12 @@ Voidmind speaks only the voidbase API. It never touches the DB.
 
 ```
 1. pull open threads (+ their goal prompt)
-2. pull recent runs/comparisons for each thread  → "what's been tried"
-3. ask the donor's LLM: given the goal + history, propose N next configs
+2. build the fitness landscape for the thread (build_context):
+     champion + confirmed promotion arc (what compounded)
+   + frontier (candidates already past the band) + ranked contenders (margins)
+   + recent rejected verdicts            → "what worked, what's dead"
+3. ask the donor's LLM: given the goal + landscape, propose N next configs
+     (extend the arc / combine the strongest near-misses / open a new direction)
 4. dedup against existing ideas/queue (content_hash)
 5. POST /ideas  +  POST /queue_items   (born low-trust, unclaimed)
 6. sleep / repeat

@@ -108,22 +108,103 @@ def recent_runs(api: str, thread: str | None = None, limit: int = 50) -> list:
     return runs[:limit]
 
 
+def gate_status(api: str, scope: str, timeout: int = 30) -> dict:
+    """The confirm-gate snapshot for a scope (GET /gate): the champion, the
+    band-clearing candidates, and the recent confirmed/rejected verdicts. This is
+    the AUTHORITATIVE fitness signal (the server judges the band via voidcheck), so
+    a proposer that builds on it can't disagree with what the gate will actually
+    promote. Best-effort: an older API or a non-dict reply yields {} and the
+    proposer simply sees no gate signal (the loop still runs)."""
+    try:
+        out = _get(api, "/gate", {"scope": scope}, timeout=timeout)
+    except ApiError:
+        return {}
+    return out if isinstance(out, dict) else {}
+
+
+def champion_lineage(api: str, scope: str, timeout: int = 30) -> list:
+    """The champion promotion arc for a scope (GET /champions, filtered + oldest-
+    first): each confirmed promotion's val_loss and the mechanism `reason`. This is
+    the COMPOUNDING story — what stacked to get here — which a proposer should
+    extend, not the flat list of every lever ever tried. Best-effort → []."""
+    try:
+        out = _get(api, "/champions", timeout=timeout)
+    except ApiError:
+        return []
+    rows = out if isinstance(out, list) else []
+    arc = [r for r in rows if r.get("scope") == scope]
+    arc.sort(key=lambda r: r.get("promoted_at") or "")
+    return arc
+
+
+def rank_contenders(runs: list, champion_val: float | None, *, top: int = 8) -> list:
+    """The fitness landscape, distilled: the best non-confirm runs by val_loss, each
+    tagged with its signed margin vs the champion (positive = beat the champion) and
+    its verification. Pure — no IO. This is what turns 'levers tried' into 'levers
+    that worked, ranked', the single biggest signal a proposer needs to combine the
+    near-misses into the next winner instead of guessing blind.
+
+    Skips failed runs (no signal), runs with no val_loss, and the `confirm-*` paired
+    machinery rows (those are re-runs of an existing candidate, not new levers)."""
+    scored = []
+    for r in runs:
+        v = r.get("final_val_loss")
+        name = r.get("name")
+        if v is None or not name or r.get("status") == "failed":
+            continue
+        if name.startswith("confirm-"):
+            continue
+        scored.append({
+            "name": name,
+            "val_loss": v,
+            "margin": round(champion_val - v, 4) if champion_val is not None else None,
+            "verification": r.get("verification"),
+        })
+    scored.sort(key=lambda x: x["val_loss"])
+    return scored[:top]
+
+
 def build_context(api: str, thread: str, *, history_limit: int = 50) -> dict:
     """Gather everything a proposer needs to suggest the next experiments for one
-    thread: the goal prompt, recent run summaries, and the set of levers already
-    tried (by run name). Pure read — no writes."""
+    thread. Beyond the goal + raw history, this assembles the OUTCOME SIGNAL — the
+    fitness landscape — so the proposer extends what's working rather than proposing
+    blind:
+
+      * champion   — the current best (run_id + val_loss) every delta is measured against
+      * lineage    — the confirmed promotion arc + mechanism reasons (the compounding story)
+      * frontier   — gate-cleared candidates: real >band improvements to build on
+      * contenders — the best runs ranked by val_loss, with signed margins (near-misses
+                     worth combining)
+      * verdicts   — recent confirmed/rejected paired outcomes (what's proven / dead)
+
+    Pure read — no writes. Every outcome field is best-effort: a thread/API without
+    the gate degrades to the original goal+history context."""
     goal = {}
     try:
         goal = thread_goal(api, thread)
     except ApiError:
         pass  # a thread may have no goal_prompt; the proposer can still work
     runs = recent_runs(api, thread, limit=history_limit)
-    tried = sorted({r.get("name") for r in runs if r.get("name")})
+    # Levers a proposer could actually re-propose: drop the `confirm-*` paired-seed
+    # machinery rows (re-runs of an existing candidate, not levers), which would
+    # otherwise bloat the prompt with a dozen near-identical names.
+    tried = sorted({r["name"] for r in runs
+                    if r.get("name") and not r["name"].startswith("confirm-")})
+    # The thread name IS the scope in this registry (runs.thread_name == scope).
+    gate = gate_status(api, thread)
+    champion = gate.get("champion") if isinstance(gate, dict) else None
+    champ_val = champion.get("val_loss") if isinstance(champion, dict) else None
     return {
         "thread": thread,
         "goal_prompt": goal.get("goal_prompt"),
         "recent_runs": runs,
         "tried_levers": tried,
+        # --- outcome signal (the fitness landscape) ---
+        "champion": champion,
+        "lineage": champion_lineage(api, thread),
+        "frontier": gate.get("clears") or [],
+        "contenders": rank_contenders(runs, champ_val),
+        "verdicts": gate.get("recent_verdicts") or [],
     }
 
 
