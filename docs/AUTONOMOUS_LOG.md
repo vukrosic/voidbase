@@ -7,6 +7,61 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Idea backlog panel — surface the proposal stream
+
+**Shipped** — voidbase `4b8c9d9`, voidspark `1e0244f`. The `/ideas` backlog (167
+candidate experiments, fed by Voidmind + manual) rendered nowhere, so "what is the
+search considering next" was invisible — the exact follow-up the last fire logged
+after building the outcome-aware proposer. Now:
+1. `/dashboard` folds in the recent-24 idea slice (one cached round-trip, no extra
+   client call). Ideas aren't scope-keyed → a global recent slice; full backlog
+   stays at `/ideas`.
+2. New `<IdeasBacklog>` on `/voidbase`, placed between the champion/gate (proven
+   story) and the operational views. Status-tagged list + a done/active/dead
+   distribution header + click-to-expand explanations. Self-contained like
+   ChampionLineage (optional `data` prop; self-fetches standalone). Status vocab
+   (12 distinct values) buckets into 3 colors so it stays scannable.
+
+**Tested** — Chrome: heading + 24 badged items render; header shows
+9 done/12 active/3 dead; click-to-expand revealed the full proposal text on
+"223 — Per-Block Learnable RoPE Base"; zero console errors. Typecheck clean.
+Backend: MISS populates 24 ideas, HIT serves in ~2ms.
+
+**Self-critique**
+- *The panel is a recent-24 window with no filter/search.* With 167 ideas and a
+  12-value status vocab, an operator can't yet ask "show me only needs-taste" or
+  page back. Fine at this size; a status filter is the obvious next iteration.
+- *Many ideas have explanation "(fed from Neon queue)"* — a placeholder, not a real
+  proposal. I correctly suppress the expand affordance for those (no ▸), but it
+  means the BACKLOG's information value is uneven: the manually-authored ideas are
+  rich, the auto-fed ones are just titles. The outcome-aware Voidmind proposer
+  (last fire) will fix this at the source once it runs — its proposals carry a real
+  `explanation` (the landscape signal that motivated them).
+- *Restart hit a BrokenPipe on the cold MISS:* my 20s curl timed out while the
+  first uncached composite query ran (>20s cold), and the server logged a broken
+  pipe writing back to the dead socket. Harmless (the payload still cached, next
+  call was 2ms), but it confirms the cold-MISS latency is real and user-visible on
+  a fresh boot. The logged "background-refresh /dashboard" move (serve stale while
+  revalidating) would hide it.
+- *No automated test for the new panel.* Consistent with the other voidspark
+  components (none have tests; the repo has no component test harness). The
+  backend addition is covered by the existing /dashboard shape only implicitly.
+
+**Next moves (priority order)**
+1. **Run the outcome-aware Voidmind proposer for real** — needs an LLM key + the
+   champion base config; would replace the "(fed from Neon queue)" placeholders
+   with landscape-motivated proposals. Gated on a key being available to the loop.
+2. **Status filter on the Idea backlog** (critique #1) — cheap, high-utility once
+   volume is browsed.
+3. **Per-run lineage breadcrumb** in the runs expand row (`/lineage?run=`) — the
+   long-deferred cheap UI win.
+4. **Background-refresh /dashboard** (serve stale while revalidating) — hides the
+   cold-MISS latency that the BrokenPipe exposed.
+5. **Get a GPU box back** — the research payoff of everything above is still
+   compute-blocked (box offline since 2026-06-18 13:34).
+
+---
+
 ## 2026-06-19 · Voidmind outcome-aware proposer (the ceiling-raiser)
 
 **Shipped** — voidbase `fb1ad6f`. The idea engine was proposing BLIND: its
