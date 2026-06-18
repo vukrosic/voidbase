@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics as st
 import sys
 import time
 from pathlib import Path
@@ -37,22 +36,18 @@ from pathlib import Path
 os.environ.setdefault("PGCONNECT_TIMEOUT", "10")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from db.conn import connect  # noqa: E402
-
-# Paired confirm runs the SAME three seeds on both arms (matches prior art's
-# validated 42/123/7). The candidate arm and the champion-baseline arm are run
-# at identical seeds so the only thing that differs is the lever under test.
-SEEDS = (42, 123, 7)
+# Integrity policy (SEEDS, the bands) and the paired-delta judgement now live in
+# voidcheck — the one place the platform's trust rules are defined + property-
+# tested. Re-exported from this module so existing importers (scripts, tests that
+# do `from scripts.confirm_daemon import SEEDS, paired_verdict`) keep working.
+from voidcheck import (  # noqa: E402,F401
+    CONFIRM_BAND,
+    SCREEN_BAND,
+    SEEDS,
+    paired_verdict,
+)
 
 DEFAULT_SCOPE = "tiny1m3m"
-# Screen band: a candidate must beat the PINNED champion val by more than this on
-# the cheap single-seed screen before we spend GPU on a 6-run confirm.
-SCREEN_BAND = 0.02
-# Confirm band: the paired 3-seed mean must beat the freshly re-run champion by
-# more than this tiny epsilon AND favour the candidate at all 3 seeds to AGREE.
-# (Prior art operator policy 2026-06-17: the paired same-batch design + 3/3 sign
-# agreement is the noise floor, not a wide band.)
-CONFIRM_BAND = 0.001
-
 RUN_COMMAND = "python run_experiment.py"   # same generic entrypoint the feeder uses
 CONFIRM_PREFIX = "confirm"                  # queue_item id namespace for confirm jobs
 
@@ -207,42 +202,9 @@ def enqueue_confirm(conn, candidate: dict, champ: dict, priority: int) -> int:
 
 
 # --- phase B: judge a finished confirm ---------------------------------------
-
-def paired_verdict(jobs: list[dict], confirm_band: float) -> dict:
-    """Pure paired-delta judgement (no DB) — easy to unit test.
-
-    Paired delta = candidate 3-seed mean − champion 3-seed mean over the MATCHED
-    seeds (negative = candidate improves). AGREE iff we have all 3 matched pairs,
-    the mean beats the band, AND every seed individually favours the candidate
-    (sign-consistency is the noise floor). Returns agrees / delta / cand_mean /
-    n_pairs / notes."""
-    by_key = {(j["arm"], j["seed"]): j for j in jobs}
-    pairs = []  # (seed, cand_val, base_val)
-    for seed in SEEDS:
-        c = by_key.get(("cand", seed))
-        b = by_key.get(("base", seed))
-        if c and b and c["val"] is not None and b["val"] is not None:
-            pairs.append((seed, c["val"], b["val"]))
-
-    if not pairs:
-        return {"agrees": False, "delta": None, "cand_mean": None, "n_pairs": 0,
-                "notes": ("confirm produced no paired vals — all 6 runs failed or "
-                          "crashed; cannot reproduce, rejecting.")}
-
-    cand_mean = st.mean(cv for _, cv, _ in pairs)
-    base_mean = st.mean(bv for _, _, bv in pairs)
-    delta = cand_mean - base_mean
-    all_favor = all(cv < bv for _, cv, bv in pairs)
-    complete = len(pairs) == len(SEEDS)
-    agrees = complete and all_favor and (delta < -confirm_band)
-    rows = "; ".join(f"s{s}: {cv:.4f} vs {bv:.4f} (Δ{cv - bv:+.4f})"
-                     for s, cv, bv in pairs)
-    notes = (f"paired {len(pairs)}/{len(SEEDS)} seeds | cand mean {cand_mean:.4f} "
-             f"vs champ {base_mean:.4f} | Δ {delta:+.4f} | "
-             f"sign {sum(cv < bv for _, cv, bv in pairs)}/{len(pairs)} favour candidate | "
-             f"band {confirm_band} | {rows}")
-    return {"agrees": agrees, "delta": delta, "cand_mean": cand_mean,
-            "n_pairs": len(pairs), "notes": notes}
+# paired_verdict now lives in voidcheck (imported at the top) — the pure judgement
+# is the platform's trust core and belongs in the property-tested library, not
+# inline in the daemon. The daemon keeps only the DB orchestration below.
 
 
 def judge_and_record(conn, candidate: dict, jobs: list[dict],
