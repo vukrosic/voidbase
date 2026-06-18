@@ -468,19 +468,15 @@ _DASH_CACHE_LOCK = threading.Lock()
 # TTL must comfortably exceed that — otherwise a snapshot expires before a second
 # poll can ever reuse it. 12s keeps concurrent tabs + the page/gate pollers off
 # the DB while staying fresher than the ~6.5-min cadence at which runs land.
-_DASH_TTL_S = 12.0
+_DASH_REFRESHING: set[str] = set()
+_DASH_FRESH_TTL_S = 12.0
+_DASH_STALE_TTL_S = 90.0
 
 
-def dashboard(scope: str) -> dict:
-    scope = scope or "tiny1m3m"
-    with _DASH_CACHE_LOCK:
-        hit = _DASH_CACHE.get(scope)
-        if hit is not None and time.monotonic() - hit[0] < _DASH_TTL_S:
-            # Serve the memoized snapshot; mark it so the client/operator can see
-            # this poll did not hit the database.
-            return {**hit[1], "cached": True}
-    # Miss: do the (serialized) DB work once, then publish for the TTL window.
-    payload = {
+def _dash_compute(scope: str) -> dict:
+    """The slow part: one (serialized) DB pass building the whole composite payload.
+    Called on a cold miss (inline) or by the background refresher (off-thread)."""
+    return {
         "scope": scope,
         "health": health(),
         "champions": rows(
@@ -499,9 +495,73 @@ def dashboard(scope: str) -> dict:
         "ideas": rows("select * from ideas order by created_at desc limit 24"),
         "cached": False,
     }
+
+
+def _dash_store(scope: str, payload: dict) -> None:
     # Stamp the cache when the data becomes AVAILABLE (after the slow work), not
-    # when the request began — the TTL window must start now, or a 13s query
-    # would publish an already-expired entry.
+    # when the request began — the TTL window must start now, or a 13s query would
+    # publish an already-expired entry.
     with _DASH_CACHE_LOCK:
         _DASH_CACHE[scope] = (time.monotonic(), payload)
-    return payload
+
+
+def _dash_refresh_async(scope: str) -> None:
+    """Recompute the snapshot off the request path, then publish it. Always clears
+    the refreshing flag so a transient DB error can't wedge the scope into a state
+    where no future refresh is ever spawned."""
+    try:
+        _dash_store(scope, _dash_compute(scope))
+    except Exception:  # noqa: BLE001 — a failed refresh just leaves the stale cache
+        pass
+    finally:
+        with _DASH_CACHE_LOCK:
+            _DASH_REFRESHING.discard(scope)
+
+
+def warm_dashboard(scope: str = "tiny1m3m") -> None:
+    """Populate the cache for a scope in the background at startup, so even the
+    FIRST user request is served from cache instead of paying the cold ~10-13s
+    wait. Best-effort and fire-and-forget."""
+    with _DASH_CACHE_LOCK:
+        if scope in _DASH_REFRESHING:
+            return
+        _DASH_REFRESHING.add(scope)
+    threading.Thread(target=_dash_refresh_async, args=(scope,), daemon=True).start()
+
+
+def dashboard(scope: str) -> dict:
+    """Composite dashboard payload with stale-while-revalidate caching. A warm cache
+    is ALWAYS served instantly; a stale-but-usable snapshot is served instantly too
+    and triggers a single background refresh. Only a cold/too-old cache blocks on
+    the DB. The payload carries `cached`/`stale`/`age_s` so the client can tell.
+
+    The page polls every 10s, so once warm the cache always lands in the
+    FRESH..STALE window and never blocks again — only the first cold request (or a
+    tab left idle past STALE) pays the ~10-13s Neon wait."""
+    scope = scope or "tiny1m3m"
+    spawn = False
+    with _DASH_CACHE_LOCK:
+        hit = _DASH_CACHE.get(scope)
+        age = (time.monotonic() - hit[0]) if hit is not None else None
+        if hit is not None and age < _DASH_FRESH_TTL_S:
+            return {**hit[1], "cached": True, "stale": False, "age_s": round(age, 1)}
+        if hit is not None and age < _DASH_STALE_TTL_S:
+            # Serve stale now; spawn ONE background refresh if none is running.
+            if scope not in _DASH_REFRESHING:
+                _DASH_REFRESHING.add(scope)
+                spawn = True
+            stale_payload = {**hit[1], "cached": True, "stale": True,
+                             "age_s": round(age, 1)}
+        else:
+            stale_payload = None
+    if stale_payload is not None:
+        if spawn:
+            threading.Thread(target=_dash_refresh_async, args=(scope,),
+                             daemon=True).start()
+        return stale_payload
+    # Cold or too-old: block and recompute inline, then publish.
+    payload = _dash_compute(scope)
+    _dash_store(scope, payload)
+    with _DASH_CACHE_LOCK:
+        _DASH_REFRESHING.discard(scope)
+    return {**payload, "age_s": 0.0, "stale": False}

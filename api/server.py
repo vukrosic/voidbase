@@ -53,6 +53,7 @@ from backend import BACKEND, DB_PATH, PG_URL, REQUIRE_AUTH, rows
 from reads import (
     activity, comparisons, contributor, dashboard, eval_points, gate, health,
     leaderboard, lineage, runs, thread_goal, threads, threads_public,
+    warm_dashboard,
 )
 from writes import (
     automation_contributor_id, box_heartbeat, claim_job, claim_thread,
@@ -225,6 +226,10 @@ def main() -> None:
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     target = "neon postgres" if PG_URL else f"sqlite {DB_PATH}"
     print(f"voidbase api on http://127.0.0.1:{port}  (backend={BACKEND}, {target})")
+    # Warm the default-scope dashboard cache off-thread so the first real request
+    # is served from cache instead of paying the cold ~10-13s composite query.
+    if PG_URL:
+        warm_dashboard("tiny1m3m")
     srv.serve_forever()
 
 
