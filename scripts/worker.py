@@ -105,11 +105,14 @@ def post_heartbeat(box_id: str) -> None:
     """Best-effort liveness ping to the voidbase API (POST box_heartbeat). Never
     raises — a missing API server or a network blip must not kill a multi-minute
     training run; the reaper handles a genuinely dead box, not a flaky ping."""
-    payload = json.dumps({"resource": "box_heartbeat", "box_id": box_id}).encode()
-    req = urllib.request.Request(
-        f"{API_URL.rstrip('/')}/box_heartbeat", data=payload,
-        headers={"Content-Type": "application/json"}, method="POST")
     try:
+        # box_id is a DB uuid object — coerce to str or json.dumps raises. Keep the
+        # whole thing inside the try so the "never raises" contract actually holds:
+        # a serialization slip must not kill a multi-minute training run either.
+        payload = json.dumps({"resource": "box_heartbeat", "box_id": str(box_id)}).encode()
+        req = urllib.request.Request(
+            f"{API_URL.rstrip('/')}/box_heartbeat", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
         urllib.request.urlopen(req, timeout=10).read()
     except Exception as e:  # noqa: BLE001
         log(f"heartbeat failed ({type(e).__name__}: {e}) — continuing")
