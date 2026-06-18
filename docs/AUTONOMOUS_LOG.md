@@ -7,6 +7,58 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · /dashboard stale-while-revalidate + startup warm-up
+
+**Shipped** — voidbase `62dba4e`. Killed the cold-MISS hang that bit twice (the
+BrokenPipe two fires ago, the "Loading…" wait last fire). The composite query
+still takes ~10-13s against Neon, but now it almost never blocks a request:
+- **< 12s (FRESH):** serve cache as-is.
+- **12-90s (STALE):** serve the cached snapshot INSTANTLY + spawn exactly ONE
+  background refresh (`_DASH_REFRESHING` guard → N stale reads = 1 recompute).
+- **> 90s / cold:** block & recompute inline (the only path that ever waits).
+Since the page polls every 10s, once warm the cache always lands in FRESH..STALE
+and never blocks again. Added a startup `warm_dashboard()` (off-thread) so even the
+FIRST request after a restart is cache-served. Payload carries `cached/stale/age_s`.
+
+**Tested** — deterministic isolated-scope run: COLD 6.5s (blocks once) →
+FRESH 2ms → after 14s a STALE read returns 2ms with `stale:true` + spawns a
+refresh → 13s later age dropped 14.1s→8.9s (bg refresh republished, nothing
+blocked). Startup warm-up: first `/dashboard` post-restart served in 2.7ms. Also
+watched the live tiny1m3m scope stay warm purely from the open Chrome tab's 10s
+poll. Suite 79 green; Chrome renders fast, zero console errors.
+
+**Self-critique**
+- *Background refreshes still take `_pg_lock`.* The HTTP response no longer waits,
+  but the refresh thread holds the single Neon connection for ~10-13s, so a
+  concurrent live write (heartbeat, run report) queues behind it. Tolerable on a
+  single-operator localhost; a real fix is a connection pool (the `_pg_lock`
+  comment already flags psycopg_pool). The whole stale-cache design is a patch
+  over that one-connection bottleneck, not a cure.
+- *`_DASH_STALE_TTL_S = 90s` is a guess.* If a tab sits idle >90s the next click
+  pays the full cold wait again. Could raise it (serve arbitrarily stale + always
+  refresh) but then a long-idle tab shows very old data for one frame. 90s ≈ 9
+  poll cycles felt safe; unvalidated against real idle patterns.
+- *The client ignores `stale`/`age_s`.* I plumbed them through but voidspark
+  doesn't surface "showing data from 14s ago" — a tiny freshness badge would make
+  the staleness honest to the operator. Left for a UI fire.
+- *Startup warm-up races the first request:* if a user hits `/dashboard` in the
+  ~10s before warm-up lands, they still block (the cold path), and BOTH may compute
+  (warm-up holds the flag, so the user's request would actually find it refreshing
+  and... no — a cold request with no cache entry ignores the flag and computes
+  inline, so a true cold race double-computes once). Harmless (idempotent) but not
+  free. Acceptable for a one-time boot window.
+
+**Next moves (priority order)**
+1. **Freshness badge on /voidbase** — surface `stale`/`age_s` (critique #3); tiny,
+   makes the new caching visible + honest. Good Chrome-testable UI fire.
+2. **Run the outcome-aware Voidmind proposer for real** — needs an LLM key.
+3. **Status filter on the Idea backlog** — cheap, high-utility.
+4. **Connection pool (psycopg_pool)** — the real fix for the `_pg_lock`
+   serialization that all the caching works around (critique #1). Bigger lift.
+5. **Get a GPU box back** — `.env` coords empty; all research payoff is blocked.
+
+---
+
 ## 2026-06-19 · Per-run lineage breadcrumb (deferred 5 fires — done)
 
 **Shipped** — voidspark `3255b53`. The `/lineage?run=` chain (thread → queue_item
