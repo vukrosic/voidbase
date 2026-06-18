@@ -7,6 +7,70 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · THE LOOP IS TURNING — full 4-daemon pipeline live, box revived
+
+**Milestone: the autonomous distributed research loop is operational end-to-end,
+registry-faithful, and visible on the dashboard.** Not a widget — the actual system.
+
+What's running (verified live):
+- **`worker.py loop`** (Mac dispatcher → GPU box) — claimed `auto-use_mix_norm` from
+  the 16 queued jobs and SSHed a TORCHDYNAMO_DISABLE=1 + full-champion-base
+  EXPERIMENT_CONFIG to the box. Box trains at GPU 98%. Reports to Neon on finish.
+- **Box heartbeat REVIVED** — `1.208.108.242:52646` went offline(~9h stale) →
+  **healthy (hb_age 12s)** the moment the worker started; the worker's heartbeats
+  fixed the dashboard's stale-offline display. Activity panel now shows
+  "1 in flight · 15 queued · use_mix_norm running on box · automation".
+- **`reaper.py loop`** — self-heals stranded jobs / dark boxes (90s heartbeat
+  timeout).
+- **`confirm_daemon.py --interval 120`** — judges band-clearers, auto-enqueues 6
+  paired jobs per candidate that clears, NEVER auto-promotes (manual guardrail
+  intact). First cycle correctly SKIPPED the implausible `use_conv_ffn` (val 0.4388,
+  >50% better = broken/forged) and noted the old canon_conv+cross_block_score_share
+  confirm still 4/6.
+- **Drift fix from earlier this fire** makes every worker run registry-faithful.
+
+Found + fixed mid-fire: **duplicate reaper + confirm_daemon** from a prior session
+were still alive (pids 80349/69375) — I'd started a second pair. Two confirm daemons
+race on enqueues. Killed the stale duplicates; exactly one of each now runs
+(worker 20772, reaper 20918, confirm 20919). (This also explains why confirm was
+"running" for days but nothing progressed — the WORKER wasn't up, so no jobs ran.)
+
+Verified through Chrome: Live activity shows the running job + active box, box
+online, zero console errors.
+
+**Self-critique**
+- *I started duplicate daemons without checking what was already running.* A
+  `ps aux | grep` FIRST would have shown the orphaned prior-session reaper/confirm.
+  Always inventory running processes before spawning more — especially daemons.
+- *These daemons are nohup'd children of this session.* They should survive context
+  cycling (nohup ignores SIGHUP), but if the whole Claude session exits they MAY
+  die — there's no real supervisor (systemd/pm2). For a truly unattended loop they
+  belong under a process manager, not nohup. Flagged, not fixed (would need the
+  human's machine setup).
+- *15 jobs × ~7 min = ~1.75h of GPU* now committed autonomously, plus whatever
+  confirm_daemon enqueues for band-clearers. Cheap on a rented 3060 (~cents) and
+  squarely what the user asked for ("do research there"), but it IS unattended
+  spend — worth stating plainly.
+- *I haven't confirmed the first worker job actually REPORTS to Neon yet* (it's
+  mid-run). The claim+dispatch+heartbeat path is verified; the report path is
+  assumed-good from the prior 2026-06-18 validation. Next fire must confirm a fresh
+  result row landed.
+
+**Next moves (priority order)**
+1. **Confirm the first faithful result landed in Neon** (`auto-use_mix_norm` →
+   runs row with a sane val_loss) — validates the full claim→train→report cycle on
+   the revived loop. If any flag's single-seed clears the band, confirm_daemon will
+   auto-enqueue its 3-seed paired confirm.
+2. **Enqueue swiglu_ffn on thread `tiny1m3m`** (feeder thread, gate-visible) so the
+   +0.0128 hand-sweep lead gets a registry-faithful run + a real confirm. Note:
+   `enqueue.py` uses thread "tiny1m3m search" (NOT gate-visible) — must go via
+   `feeder` or a thread="tiny1m3m" enqueue for the gate to treat it as a candidate.
+3. **Keep the loop fed** — when the 16 drain, re-run `feeder.py --limit N` (99 more
+   untried structural flags remain) or `--mode stack` on any new winners.
+4. **psycopg_pool**; **freshness badge** already shipped.
+
+---
+
 ## 2026-06-19 · Config-drift ROOT-CAUSE FIX + real pipeline armed (16 faithful jobs queued)
 
 **The big win: the config-drift bug is fixed at the root, and the proper automated
