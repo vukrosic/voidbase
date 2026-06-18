@@ -32,11 +32,14 @@ Endpoints (GET unless noted, JSON):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import sys
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -53,6 +56,20 @@ RUN_STATUS = {"completed": "done", "stopped": "failed"}
 # Resolved once at startup: Postgres if a connection string is configured.
 PG_URL = database_url(pooled=True)
 BACKEND = "postgres(neon)" if PG_URL else "sqlite(legacy)"
+
+# How long a claimed job is leased before the reaper may reclaim it (Voidrunner
+# /claim). Matches scripts/worker.py's LEASE_SECONDS so the operator-dispatcher
+# and donor-runner agree on lease length.
+LEASE_SECONDS = int(os.environ.get("VOIDBASE_LEASE_SECONDS", "1800"))
+
+# The localhost dev-bypass (no-token writes from 127.0.0.1 act as 'automation')
+# is safe ONLY when the server is genuinely reached over loopback. Behind a
+# reverse proxy every request's client address is the proxy's 127.0.0.1, which
+# would hand the bypass to the whole internet. A public deployment MUST set
+# VOIDBASE_REQUIRE_AUTH=1 — then a valid bearer token is required even from
+# loopback and the proxy can't launder anonymous writes. Default off so the
+# single-operator localhost workflow (worker.py, the dashboard) is unchanged.
+REQUIRE_AUTH = os.environ.get("VOIDBASE_REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
 
 
 # --- backend-agnostic query helpers -----------------------------------------
@@ -537,6 +554,233 @@ def release_thread(body: dict) -> dict:
     return out[0]
 
 
+# --- Voidrunner: auth + the compute-donor write protocol --------------------
+#
+# These four handlers are the server side of the compute-donor client
+# (docs/VOIDRUNNER.md). They differ from the dashboard writes above in one way:
+# the client runs on a machine the operator does NOT control, so it holds no DB
+# creds and authenticates with a bearer token instead. The atomic claim that used
+# to live as direct SQL in scripts/worker.py moves here, behind the API.
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def contributor_for_token(token: str) -> str | None:
+    """Resolve a bearer token to a contributor id, or None if unknown."""
+    out = _pg_rows("select id from contributors where token_hash = %s",
+                   (_token_hash(token),))
+    return out[0]["id"] if out else None
+
+
+def automation_contributor_id() -> str:
+    """The token-less identity used by the localhost dev bypass (the operator's
+    own dashboard / worker.py). Created on demand, idempotent."""
+    out = _pg_exec(
+        """insert into contributors (handle, role) values ('automation', 'maintainer')
+           on conflict (handle) do update set handle = excluded.handle
+           returning id""")
+    return out[0]["id"]
+
+
+def register(body: dict) -> dict:
+    """Mint a contributor + bearer token. The plaintext token is returned ONCE,
+    here, and never stored — only its sha256 hash lands in the DB. A handle is
+    claim-once: re-registering an existing handle is refused (so a token can't be
+    silently rotated out from under its owner). The operator issues tokens from
+    localhost for v0; GitHub-OAuth issuance via voidspark comes later."""
+    handle = (body.get("handle") or "").strip()
+    if not handle:
+        raise ValueError("register requires a 'handle'")
+    token = secrets.token_urlsafe(32)
+    out = _pg_exec(
+        """insert into contributors (handle, role, token_hash)
+           values (%s, 'contributor', %s)
+           on conflict (handle) do nothing
+           returning id, handle""",
+        (handle, _token_hash(token)))
+    if not out:
+        raise ValueError(f"handle already registered: {handle}")
+    # The token is shown exactly once; the caller must save it now.
+    return {"contributor_id": out[0]["id"], "handle": out[0]["handle"], "token": token}
+
+
+def _ensure_box(contributor_id: str, box: dict) -> str:
+    """Find-or-create this contributor's box row, keyed by (contributor, finger-
+    print) like worker.ensure_identity. Returns the box id. A donor's box belongs
+    to the donor — never the operator — so attribution and per-box baselines are
+    correct."""
+    fingerprint = (box.get("fingerprint") or "").strip() or "default"
+    out = _pg_exec(
+        """insert into boxes (contributor_id, label, gpu_class, fingerprint)
+           values (%(cid)s, %(label)s, %(gpu)s, %(fp)s)
+           on conflict (contributor_id, fingerprint)
+             do update set label = coalesce(excluded.label, boxes.label),
+                           gpu_class = coalesce(excluded.gpu_class, boxes.gpu_class)
+           returning id""",
+        {"cid": contributor_id, "label": box.get("label"),
+         "gpu": box.get("gpu_class"), "fp": fingerprint})
+    return out[0]["id"]
+
+
+# The atomic claim, moved server-side from scripts/worker.py. UPDATE…FROM(SELECT
+# …FOR UPDATE SKIP LOCKED LIMIT 1) is the collision-proof Postgres job lock: two
+# runners firing at once never get the same row, and an expired lease is auto-
+# reclaimed so a dead runner never strands a job. The optional gpu_class filter
+# lets a donor claim only jobs its GPU can run (a null job gpu_class = anything).
+_CLAIM_SQL = """
+update queue_items q
+set status = 'claimed',
+    claimed_by_box = %(box)s,
+    claimed_at = now(),
+    lease_expires_at = now() + make_interval(secs => %(lease)s)
+from (
+    select id
+    from queue_items
+    where (status = 'needs-run'
+           or (status in ('claimed', 'running')
+               and lease_expires_at is not null
+               and lease_expires_at < now()))
+      and (%(gpu)s::text is null or gpu_class is null or gpu_class = %(gpu)s)
+      and (%(thread)s::text is null or thread_name = %(thread)s)
+    order by priority desc, created_at asc
+    for update skip locked
+    limit 1
+) pick
+where q.id = pick.id
+returning q.id, q.thread_name, q.name, q.command, q.config, q.content_hash;
+"""
+
+
+def claim_job(body: dict, contributor_id: str) -> dict:
+    """Atomically lease the next runnable job for this contributor's box, or
+    return {"job": null}. The box is identified by body['box'] = {label,
+    gpu_class, fingerprint}; an optional body['gpu_class_filter'] restricts which
+    jobs are eligible; an optional body['thread'] scopes the claim to one research
+    thread (a donor or agent focusing a thread). Returns the job plus the resolved
+    box_id, which the runner echoes back on /runs."""
+    box = body.get("box") or {}
+    box_id = _ensure_box(contributor_id, box)
+    gpu = (body.get("gpu_class_filter") or "").strip() or None
+    thread = (body.get("thread") or "").strip() or None
+    out = _pg_exec(_CLAIM_SQL,
+                   {"box": box_id, "lease": LEASE_SECONDS, "gpu": gpu, "thread": thread})
+    if not out:
+        return {"job": None, "box_id": box_id}
+    r = out[0]
+    return {
+        "box_id": box_id,
+        "job": {
+            "id": r["id"],
+            "thread": r.get("thread_name"),
+            "name": r.get("name"),
+            "command": r.get("command"),
+            "config": r.get("config"),
+            "content_hash": r.get("content_hash"),
+        },
+    }
+
+
+def report_run(body: dict, contributor_id: str) -> dict:
+    """Record a finished run and close its queue item, in one transaction. The
+    run is born verification='unverified' — a donor can never move the champion;
+    that still goes through the confirm gate. Mirrors scripts/worker.py:report(),
+    but contributor_id comes from the bearer token, not a trusted local identity.
+
+    A run row needs its queue item, its box, and a terminal status. seed is
+    pulled through (from the config) so the comparison engine can pair it — a
+    null-seed run is unpaired and therefore wasted signal."""
+    qid = (body.get("queue_item_id") or "").strip()
+    if not qid:
+        raise ValueError("report requires 'queue_item_id'")
+    box_id = (body.get("box_id") or "").strip()
+    if not box_id:
+        raise ValueError("report requires 'box_id' (from the /claim response)")
+    status = (body.get("status") or "").strip().lower()
+    if status not in ("done", "failed"):
+        raise ValueError("report 'status' must be 'done' or 'failed'")
+
+    # The box must be one this contributor owns — a donor can't attribute a run to
+    # someone else's box. Per-box baselines de-drift the screen, so an honest
+    # box_id is an integrity property, not just bookkeeping.
+    owns = _pg_rows(
+        "select 1 from boxes where id = %s::uuid and contributor_id = %s",
+        (box_id, contributor_id))
+    if not owns:
+        raise ValueError("box_id is not one of your boxes")
+
+    qrow = _pg_rows(
+        "select thread_name, name from queue_items where id = %s", (qid,))
+    if not qrow:
+        raise ValueError(f"no such queue_item: {qid}")
+    thread_name = qrow[0]["thread_name"]
+    name = qrow[0]["name"]
+
+    config = body.get("config")
+    seed = body.get("seed")
+    if seed is None and isinstance(config, dict):
+        seed = config.get("seed")
+    run_id = f"{qid}--{uuid.uuid4().hex[:8]}"
+
+    _pg_exec(
+        """insert into runs (id, queue_item_id, thread_name, name, contributor_id,
+                             box_id, command, config, content_hash, seed, status,
+                             final_val_loss, final_train_loss, final_val_accuracy,
+                             finished_at)
+           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())""",
+        (run_id, qid, thread_name, name, contributor_id, box_id,
+         body.get("command"),
+         json.dumps(config) if config is not None else None,
+         body.get("content_hash"), seed, status,
+         body.get("final_val_loss"), body.get("final_train_loss"),
+         body.get("final_val_accuracy")))
+
+    # Optional per-step learning curve (eval_points). Best-effort: a malformed
+    # point list must not lose the run row we just wrote.
+    points = body.get("eval_points") or []
+    for p in points:
+        try:
+            _pg_exec(
+                """insert into eval_points (run_id, step, tokens, val_loss,
+                                            val_accuracy, val_perplexity,
+                                            learning_rate, elapsed_seconds)
+                   values (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (run_id, p.get("step"), p.get("tokens"), p.get("val_loss"),
+                 p.get("val_accuracy"), p.get("val_perplexity"),
+                 p.get("learning_rate"), p.get("elapsed_seconds")))
+        except Exception:  # noqa: BLE001
+            pass
+
+    _pg_exec("update queue_items set status = %s, finished_at = now() where id = %s",
+             (status, qid))
+    return {"run_id": run_id, "queue_item_id": qid, "status": status,
+            "verification": "unverified", "seed": seed}
+
+
+def release_job(body: dict, contributor_id: str) -> dict:
+    """Return a claimed job to the queue (needs-run), clearing the claim fields.
+    For a dry-run validation that must not leave a runs row, or a graceful Ctrl-C.
+    Only the box-owning contributor may release — a runner can't kick another
+    donor's job."""
+    qid = (body.get("queue_item_id") or "").strip()
+    if not qid:
+        raise ValueError("release requires 'queue_item_id'")
+    out = _pg_exec(
+        """update queue_items q
+           set status = 'needs-run', started_at = null,
+               claimed_by_box = null, claimed_at = null, lease_expires_at = null
+           from boxes b
+           where q.id = %(qid)s
+             and q.claimed_by_box = b.id
+             and b.contributor_id = %(cid)s
+           returning q.id""",
+        {"qid": qid, "cid": contributor_id})
+    if not out:
+        raise ValueError(
+            f"cannot release {qid}: not found, or not claimed by your box")
+    return {"released": out[0]["id"]}
+
+
 ROUTES = {
     "/health": health,
     "/activity": activity,
@@ -559,17 +803,49 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self) -> None:  # noqa: N802 - http.server API
-        """The writes the platform performs (localhost, single operator, no auth
-        — see module docstring):
-          * author / update a research thread   (the dashboard, default on /threads)
-          * claim a thread       action=claim    (sets claimed_by + 48h expiry)
-          * release a claim      action=release  (clears the claim fields)
-          * record a box heartbeat               (the worker, /box_heartbeat)
+    def _authenticate(self):
+        """Resolve the writer's contributor id for the token-gated endpoints
+        (claim / runs / release). Returns the id, or sends a 401 and returns None.
 
-        Dispatch is by URL path (/threads, /box_heartbeat); a client may instead
-        POST the base URL with a {resource: '...'} field in the body — the worker
-        sends {resource: 'box_heartbeat', box_id, gpu_class?}."""
+          * `Authorization: Bearer <token>` → the matching contributor.
+          * No token, from localhost → the 'automation' contributor (the dev
+            bypass that keeps worker.py / the dashboard working unchanged).
+          * No token, from a remote client → 401.
+
+        The localhost bypass is what lets the operator's own tools skip auth while
+        a real donor over the network must present a token."""
+        auth = self.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        if token:
+            cid = contributor_for_token(token)
+            if not cid:
+                self._send(401, {"error": "invalid bearer token"})
+                return None
+            return cid
+        # No token: the loopback bypass, unless this is a public deployment that
+        # has turned it off (REQUIRE_AUTH) — see the REQUIRE_AUTH comment for why
+        # a proxied deployment must, or it hands the bypass to every client.
+        if not REQUIRE_AUTH and self.client_address[0] in ("127.0.0.1", "::1", "localhost"):
+            return automation_contributor_id()
+        self._send(401, {"error": "missing bearer token"})
+        return None
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        """The platform's writes. Two tiers:
+
+          * Operator/dashboard (localhost, no auth, unchanged):
+            - author / update a research thread   (/threads, default)
+            - claim / release a thread            (/threads, action=claim|release)
+            - record a box heartbeat              (/box_heartbeat)
+          * Voidrunner compute-donor protocol (bearer token; localhost bypass):
+            - mint a contributor + token          (/register, no auth)
+            - claim the next job                  (/claim)
+            - report a finished run               (/runs)
+            - release a claimed job               (/release)
+
+        Dispatch is by URL path; a client may instead POST the base URL with a
+        {resource: '...'} field in the body (the worker sends {resource:
+        'box_heartbeat', ...})."""
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
@@ -579,21 +855,32 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": f"bad json: {e}"})
             return
         resource = path.lstrip("/") or str(body.get("resource") or "")
-        writable = {"threads", "box_heartbeat"}
+        # Endpoints that require a contributor identity (token, or localhost bypass).
+        authed = {"claim", "runs", "release"}
+        writable = {"threads", "box_heartbeat", "register"} | authed
         if resource not in writable:
             self._send(404, {"error": "not found", "writable": sorted(writable)})
             return
         if not PG_URL:
             self._send(501, {"error": f"{resource} writes require the Postgres backend"})
             return
-        if resource == "box_heartbeat":
-            handler = box_heartbeat
-        else:  # threads — author/update, or claim/release by action
-            action = (body.get("action") or "").strip().lower()
-            handler = {"claim": claim_thread, "release": release_thread}.get(
-                action, upsert_thread)
         try:
-            self._send(200, handler(body))
+            if resource in authed:
+                cid = self._authenticate()
+                if cid is None:
+                    return  # 401 already sent
+                handler = {"claim": claim_job, "runs": report_run,
+                           "release": release_job}[resource]
+                self._send(200, handler(body, cid))
+            elif resource == "register":
+                self._send(200, register(body))
+            elif resource == "box_heartbeat":
+                self._send(200, box_heartbeat(body))
+            else:  # threads — author/update, or claim/release by action
+                action = (body.get("action") or "").strip().lower()
+                handler = {"claim": claim_thread, "release": release_thread}.get(
+                    action, upsert_thread)
+                self._send(200, handler(body))
         except ValueError as e:  # bad/insufficient input from the client
             self._send(400, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
