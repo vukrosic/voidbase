@@ -20,7 +20,6 @@ An experiment is a JSON of overrides on top of the champion. The feeder:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import itertools
 import json
 import os
@@ -31,6 +30,10 @@ from pathlib import Path
 os.environ.setdefault("PGCONNECT_TIMEOUT", "10")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from db.conn import connect  # noqa: E402
+# content_hash now lives in the pure voidconfig lib so feeder and the API's
+# POST /queue_items hash identically (re-exported here, like confirm_daemon
+# re-exports from voidcheck, so existing importers — enqueue.py — keep working).
+from voidconfig import content_hash  # noqa: E402,F401
 
 DEFAULT_REPO = Path("/Users/vukrosic/my-life/llm-research-kit-scaling")
 THREAD = "tiny1m3m"
@@ -71,12 +74,6 @@ def champion_base(repo: Path) -> dict:
         "seed": champ.get("seed", 42),
         "champ_flags": set(champ.get("flags", [])),
     }
-
-
-def content_hash(env: dict, fields: dict) -> str:
-    """Stable dedup key over the resolved config (seed-independent)."""
-    blob = json.dumps({"env": env, "fields": fields}, sort_keys=True)
-    return hashlib.sha256(blob.encode()).hexdigest()[:32]
 
 
 def already_seen(conn) -> set[str]:
