@@ -7,6 +7,59 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · 🎯 SwiGLU CLEARS THE BAND faithfully → autonomous paired confirm running
+
+**The autonomous research loop found and is now confirming a genuine new champion
+challenger — end-to-end, no human in the path.**
+
+- **SwiGLU faithful result: `use_swiglu_ffn` = 6.1581, +0.0139 vs champion 6.172 —
+  CLEARS the 0.01 band.** The hand-sweep's +0.0128 holds registry-clean (even a hair
+  stronger). The gate now lists it as a band-clearing candidate (blocker: null, gate
+  live). This is the FIRST real champion challenger of this search, pulled from the
+  115-untried-mechanism space discovered two fires ago — the untried-space thesis is
+  now empirically validated, not just argued.
+- **confirm_daemon auto-enqueued SwiGLU's 3-seed paired confirm (6 jobs)** the cycle
+  after it landed (Phase A). The worker will drain them; once all 6 are terminal the
+  daemon judges the paired delta — and if it holds, SwiGLU is confirmation-ready (the
+  manual-promotion guardrail still gates the actual champion swap, by design).
+- **Unstuck the stale `canon_conv+cross_block_score_share` confirm.** It was frozen
+  at 4/6 forever — 2 of its paired jobs (base-s42, cand-s7) were CANCELLED when the
+  box went dark days ago, and "terminal" only counts done/failed, so it could never
+  reach 6/6 or be judged. Re-queued the 2 cancelled jobs (they carry their config) so
+  it completes and gets a real verdict. (My paired test two fires ago suggested its
+  +0.0176 was unpaired-inflated to ~+0.0044 — the confirm will settle it honestly.)
+- mla finished: 6.1966 (−0.0246, HURTS — clear negative result).
+
+**Also shipped** — `scripts/loop_status.py` (commit `ca14fa4`): one-shot loop health
+(daemons / box heartbeat / queue / in-flight / recent deltas) from authoritative
+state, not the block-buffered daemon logs that fooled me last fire. Exit non-zero on
+an unhealthy loop. Dogfooded it this fire to catch SwiGLU starting + mla's result.
+
+**Self-critique**
+- *The cancelled-job confirm deadlock is a latent bug, not just stale data.* ANY
+  candidate whose confirm has a cancelled job (box outage, reaper cancel, manual)
+  freezes at <6/6 forever — confirm_daemon's terminal check is `done/failed` only.
+  I hand-fixed THIS instance; the real fix is the daemon treating a cancelled
+  confirm job as needing re-queue (or counting it terminal and judging on what
+  landed). Logged as a code fix, not just an op.
+- *Single-seed "clears band" is still a LEAD, not a verdict.* SwiGLU at +0.0139 on
+  one seed is promising; the 3-seed paired confirm now running is what makes it real.
+  I'm stating it as a challenger, not a new champion — the system's whole point.
+- *I re-queued canon_conv's jobs, adding GPU load* that competes with SwiGLU's
+  confirm. Fine (both drain), but it means SwiGLU's verdict is a few runs further
+  out. Acceptable — resolving the old lead honestly is worth it.
+
+**Next moves (priority order)**
+1. **Watch SwiGLU's paired confirm complete + get judged** — the live research
+   question. If confirmed, surface it for the human to promote (guardrail).
+2. **Fix the confirm-daemon cancelled-job deadlock in code** (critique #1): a
+   cancelled confirm job must be re-queued or counted, so a box outage can't freeze
+   a candidate forever.
+3. **Keep feeding** the 115-untried space (`feeder.py --limit N`).
+4. **`python -u`** daemons; **psycopg_pool**.
+
+---
+
 ## 2026-06-19 · Loop validated end-to-end + SwiGLU lead queued for faithful confirm
 
 **The revived loop's full cycle is confirmed working, and the real lead is teed up.**
