@@ -7,6 +7,52 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Loop validated end-to-end + SwiGLU lead queued for faithful confirm
+
+**The revived loop's full cycle is confirmed working, and the real lead is teed up.**
+
+1. **Full claim→train→report cycle VALIDATED.** The first job the worker drained,
+   `auto-use_mix_norm`, completed on the box and **reported to Neon: val_loss 6.1725,
+   queue item → done.** (The worker's stdout log is block-buffered to its file so it
+   looked stuck — the registry is the truth; the run row + queue status confirm it.)
+   Result itself: 6.1725 = −0.0005 vs champion 6.172, sub-band noise — a valid
+   NEGATIVE result, mix_norm doesn't help.
+2. **SwiGLU lead queued for a faithful run.** The hand-sweep found `use_swiglu_ffn`
+   +0.0128 (the one >band lead) but that was a hand-built config. Enqueued it +
+   `use_qk_layernorm` on thread `tiny1m3m` (gate-visible) at **priority 9** (above the
+   16 feeder jobs at 5), via the feeder's own `make_experiment`/`champion_base` so the
+   row is registry-identical. The worker runs these NEXT; if SwiGLU's +0.0128 holds
+   registry-faithfully and clears the band, confirm_daemon auto-enqueues its 3-seed
+   paired confirm → the path to the first new champion mechanism in this search.
+   (`use_parallel_block` skipped — already in the dedup space.)
+
+Loop state: worker draining (GPU 100%), 16 needs-run (14 feeder @ pri 5 + swiglu/
+qk_layernorm @ pri 9), box healthy/heartbeating, reaper + confirm_daemon up.
+
+**Self-critique**
+- *I almost misdiagnosed the buffered worker log as a hang.* Spent two checks
+  chasing "why no report" before querying the registry directly — which instantly
+  showed mix_norm done @ 6.1725. Lesson: for a backgrounded process logging to a
+  file, trust the DB/state, not the (buffered) log tail. Could also launch the
+  worker with `python -u` for unbuffered logs — worth doing next time.
+- *mix_norm being sub-band is the expected base rate.* Most single flags won't beat
+  a 6-mechanism-deep champion; the value is in the rare winner (SwiGLU may be one).
+  The loop's job is to cheaply rule out the 99% — which it's now doing autonomously.
+- *I prioritized only 2 of the promising untried flags.* SwiGLU is the evidenced
+  lead so that's right, but a fuller campaign would queue the whole shortlist. Kept
+  it tight to get SwiGLU a clean, faithful answer first.
+
+**Next moves (priority order)**
+1. **Read SwiGLU's faithful result** next fire — does +0.0128 hold registry-clean?
+   If it clears the band, confirm_daemon will already be paired-confirming it; watch
+   the gate. THIS is the live research question.
+2. **Keep the loop fed** — when needs-run drops low, `feeder.py --limit N` (97 more
+   untried structural flags) or `--mode stack` on any confirmed winners.
+3. **`python -u` for the daemons** so logs are unbuffered (critique #1).
+4. **psycopg_pool**.
+
+---
+
 ## 2026-06-19 · THE LOOP IS TURNING — full 4-daemon pipeline live, box revived
 
 **Milestone: the autonomous distributed research loop is operational end-to-end,
