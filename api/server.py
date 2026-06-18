@@ -634,13 +634,32 @@ def lineage(run_id: str) -> dict:
     return voidcredit.run_lineage(run, queue_item=qi, thread=thread, champions=champs)
 
 
+def _confirm_progress(run_id: str) -> dict | None:
+    """How far along the paired 3-seed confirm for one candidate is: terminal vs
+    total jobs (target 6 = 3 seeds x 2 arms), or None if no confirm is in flight.
+    Mirrors the daemon's id-prefix re-filter in Python (a run id's '_' is a LIKE
+    wildcard, so the SQL LIKE can over-match)."""
+    prefix = f"confirm-{run_id}-"
+    rows = _pg_rows("select id, status from queue_items where id like %s",
+                    (f"{prefix}%%",))
+    jobs = [r for r in rows
+            if r["id"].startswith(prefix)
+            and r["id"][len(prefix):].split("-s")[0] in ("cand", "base")]
+    if not jobs:
+        return None
+    terminal = sum(1 for j in jobs if j["status"] in ("done", "failed"))
+    return {"terminal": terminal, "total": len(jobs)}
+
+
 def gate(scope: str) -> dict:
     """Read-only status of the confirm gate for a scope: the live champion, the
     candidate field (runs that CLEAR the screen band vs the closest sub-band
     near-miss), and the SINGLE blocker keeping the gate from promoting. Surfaces in
     one HTTP call what the confirm daemon only logs, so the dashboard can show WHY
     the champion is or isn't moving. Band + plausibility come from voidcheck (the
-    single source), so this can never disagree with the daemon's own judgement."""
+    single source), so this can never disagree with the daemon's own judgement.
+    Each band-clearing candidate carries its live confirm progress (terminal/total
+    jobs) when a paired confirm is in flight."""
     scope = scope or "tiny1m3m"
     if not PG_URL:
         return {}
@@ -672,6 +691,7 @@ def gate(scope: str) -> dict:
         entry = {"id": row["id"], "name": row["name"], "val_loss": v,
                  "margin": round(champ_val - v, 4)}
         if voidcheck.beats_screen(v, champ_val):
+            entry["confirm"] = _confirm_progress(row["id"])  # in-flight progress or None
             clears.append(entry)
         elif near_miss is None:
             near_miss = entry  # rows are val-ascending, so the first sub-band is closest
