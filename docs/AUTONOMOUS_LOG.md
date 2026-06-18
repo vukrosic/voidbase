@@ -7,6 +7,45 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Composite /dashboard endpoint + client migration
+
+**Shipped** — voidbase `3919168`, voidspark `8c65cc4`.
+1. `GET /dashboard?scope=` (api/server.py): composes health + champions + gate
+   + runs + comparisons + activity into ONE payload, memoized behind a 12s TTL.
+   The backend shares one Neon connection behind `_pg_lock`, so six separate
+   queries serialize and pollers pile up — this collapses them and a cache hit
+   never takes the lock. Verified: MISS 8.2s, HIT 1.9ms (~4000×).
+2. Migrated the /voidbase page to call `/dashboard` once and feed champions +
+   gate to the components as props (both kept an optional `data` prop; they
+   self-fetch when standalone, e.g. GateStatus on /research). Verified through
+   Chrome: **one Refresh = 1 POST, down from 6**; zero console errors clean.
+
+**Self-critique**
+- *Caught my own cache bug in testing:* v1 stamped the TTL with the timestamp
+  from the START of the request, so a 13s query published an already-expired
+  entry — it never cache-hit. Fixed by stamping after the work completes. Lesson:
+  for slow producers, the TTL clock must start when the value is READY.
+- *Two React warnings appeared* ("useEffect dep array changed size") — confirmed
+  Fast-Refresh false positives from live-editing the dep arrays (Previous len 1 →
+  Incoming len 3); a clean mount shows none. Not shipped breakage, but noted.
+- *The cache is per-process and unbounded* (one entry per scope — currently 1).
+  Fine now; if scopes proliferate it should get a max-size/LRU. Low priority.
+- *Still 8–13s on a cache MISS.* The composite doesn't make Neon faster, it just
+  stops the pile-up. A genuinely fast dashboard would need either a closer
+  read-replica or precomputed snapshots. Acceptable — misses are now rare.
+
+**Next moves (priority order)**
+1. **Split `api/server.py` (now ~1240 lines)** — the god-file; extract route
+   groups (reads / gate+dashboard / voidrunner-write / threads) into modules
+   behind a thin dispatcher. Pure refactor, directly serves the "no god files"
+   rule. Do this next while the structure is fresh in mind.
+2. **Per-run lineage breadcrumb** in the runs expand row (`/lineage?run=`).
+3. **Voidmind idea engine** — the real research ceiling (search is flat).
+4. **Background-refresh /dashboard** so even a MISS is hidden: serve stale while
+   revalidating, so the client never waits 13s.
+
+---
+
 ## 2026-06-19 · Confirm gate on /voidbase + polling fix (voidspark)
 
 **Shipped** — voidspark `f7f8713`, `82690cc`.
