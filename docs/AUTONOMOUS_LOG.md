@@ -7,6 +7,59 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Split api/server.py god-file (4 modules)
+
+**Shipped** — voidbase `e4acd44`. The 1252-line `api/server.py` (DB plumbing +
+every read + every write + auth + the HTTP dispatcher in one file) is now four
+modules by responsibility, zero behavior change:
+- `api/backend.py` (132) — backend-agnostic helpers (rows/_pg_rows/_pg_exec) +
+  resolved config (PG_URL, BACKEND, REQUIRE_AUTH, LEASE_SECONDS).
+- `api/reads.py` (502) — every GET builder + the composite /dashboard cache.
+- `api/writes.py` (476) — every mutating endpoint + bearer-token auth.
+- `api/server.py` (227) — now ONLY the Handler, ROUTES, and main().
+
+Sibling imports work because `python3 api/server.py` puts `api/` on sys.path[0];
+each module self-inserts the repo root for db.conn/voidcheck/voidcredit/voidconfig
+so it stays independently importable (tests, REPL).
+
+**Tested** — server boots on neon; `/health`, `/gate` (champion 6.172, 1 clears,
+gate live), `/dashboard` (MISS 5.7s → HIT 2.3ms, cache survived the split), and
+POST dispatch (register→400, unknown-resource→404 writable list) all return
+identical shapes. Drove Chrome to `/voidbase`: full render (lineage −0.0683 over
+6 promotions, gate live with 1 candidate confirming, 89 runs, 14 comparisons),
+**zero console errors**.
+
+**Self-critique**
+- *The split is pure hygiene, not capability.* It buys readability + a place to
+  add endpoints without growing one file — real, but it doesn't move the search
+  or the latency. The honest priority remains the idea engine (next).
+- *Each module re-does `sys.path.insert(0, repo_root)`* (3 copies). Defensible —
+  it keeps every module importable standalone — but it's duplicated boot logic.
+  A tiny `api/_bootstrap.py` could centralize it; not worth a file yet.
+- *No automated test imports these modules*, so the "byte-identical contract"
+  claim rests on the manual curl + Chrome pass, not a regression guard. A cheap
+  win: a smoke test that imports server and asserts ROUTES + the GET handler map.
+  The existing api tests are HTTP-integration (skip when no server) — they'd have
+  caught a contract break only if run against the live box.
+- *backend.py imports psycopg lazily inside the helpers* (unchanged from before).
+  Good for the SQLite-only path, but means a missing psycopg surfaces per-request,
+  not at boot. Pre-existing; left as-is to keep the refactor behavior-preserving.
+
+**Next moves (priority order)**
+1. **Voidmind idea engine** — the real research ceiling. The search is flat (best
+   single lever +0.0136 = noise at the 0.01 band); stack mode found ONE real
+   >band combo (canon_conv+cross_block_score_share, +0.0176, mid-confirm). An LLM
+   proposer that reads lineage and emits *novel* mechanisms is the only lever that
+   raises the ceiling. Biggest payoff. Now unblocked by the clean writes module.
+2. **Per-run lineage breadcrumb** in the runs expand row (`/lineage?run=`) —
+   deferred four fires running; still the cheapest UI win.
+3. **Smoke test for the api split** — import server, assert the route maps, so a
+   future edit can't silently drop an endpoint (see critique #3).
+4. **Background-refresh /dashboard** — serve stale while revalidating so even a
+   MISS (still 5–13s) is hidden from the client.
+
+---
+
 ## 2026-06-19 · Composite /dashboard endpoint + client migration
 
 **Shipped** — voidbase `3919168`, voidspark `8c65cc4`.
