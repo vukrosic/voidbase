@@ -706,10 +706,23 @@ def gate(scope: str) -> dict:
                    f"is inside the {voidcheck.SCREEN_BAND} screen band; needs a better idea")
     else:
         blocker = "no contender — no plausible run beats the champion yet"
+    # Recently judged candidates — a confirmed/rejected run drops out of `clears`
+    # (candidates() excludes anything with a confirmation), so without this the
+    # outcome would silently vanish. Closes the lifecycle: clears → confirming →
+    # verdict. delta < 0 = candidate improved on the freshly re-run champion.
+    verdicts = _pg_rows(
+        "select r.name, cf.run_id, cf.agrees, cf.delta_from_original, cf.created_at "
+        "from confirmations cf join runs r on r.id = cf.run_id "
+        "where r.thread_name = %s order by cf.created_at desc limit 5", (scope,))
+    recent_verdicts = [
+        {"name": v["name"], "run_id": v["run_id"], "agrees": v["agrees"],
+         "delta": v["delta_from_original"], "at": str(v["created_at"])}
+        for v in verdicts]
     return {"scope": scope, "screen_band": voidcheck.SCREEN_BAND,
             "champion": {"run_id": champ["run_id"], "val_loss": champ_val,
                          "has_config": champ["has_config"]},
-            "clears": clears, "near_miss": near_miss, "blocker": blocker}
+            "clears": clears, "near_miss": near_miss, "blocker": blocker,
+            "recent_verdicts": recent_verdicts}
 
 
 # --- Voidrunner: auth + the compute-donor write protocol --------------------
