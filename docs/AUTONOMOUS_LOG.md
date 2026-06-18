@@ -7,6 +7,80 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · GPU box revived → REAL paired research run (frontier candidate likely noise)
+
+**First compute fire in days — and it produced a real research finding, not code.**
+
+**The box is ALIVE.** The heartbeat had been stale ~9h so the dashboard showed it
+offline, but the box itself (RTX 3060 12GB, `1.208.108.242:52646`, via the
+`connect-to-gpu` skill) is up and research-capable — only the heartbeat *loop*
+died, not the box. Verified: repo present, dataset `pretrain_1B` present, GPU idle.
+
+**Ran real experiments** (`run_experiment.py`, `Tiny1M3MAlibiConfig`, seed 42):
+1. First attempt built on a BARE config → 6.2556. Discovered the box has NO
+   `autoresearch/champion.json`, so `run_experiment.py` had no champion base to
+   merge onto — it trained bare-alibi + the 2 flags, ≈ early-champion level. A real
+   config-drift bug: the champion config lives only in Neon, not on the box.
+2. Fetched the true champion config from Neon (`muon_lr 0.048, muon_momentum 0.9,
+   use_poly_alibi, use_deepnet_alpha` + alibi env) and ran a FAITHFUL PAIRED run,
+   same seed/box, back-to-back:
+     - **Baseline (champion):              6.1778**  (registry champion 6.172 — reproduced within noise ✓)
+     - **Candidate (champion+canon_conv+cross_block_score_share): 6.1734**
+     - **Paired delta = +0.0044** — INSIDE the 0.01 screen band.
+
+**The finding:** the registry's leading "frontier" candidate, which showed +0.0176
+and read as the search's first real >band winner, gives only **+0.0044 on a
+faithful paired seed — i.e. sub-band noise.** The +0.0176 was an UNPAIRED
+comparison (the candidate's lucky single seed 6.1544 vs the champion's recorded
+6.172). The paired baseline+candidate in one session collapses it to +0.0044. This
+is exactly the paired-vs-unpaired trust gap voidbase is built to catch — and it
+says this candidate would likely NOT survive a real confirm. The gate's skepticism
+was right; the search is still genuinely plateaued.
+
+**Honest caveats (do not over-claim):**
+- *One seed, not a 3-seed confirm.* +0.0044 is suggestive, not a verdict.
+- *Reconstruction drift:* my candidate seed-42 (6.1734) differs from the registry's
+  recorded cand-s42 (6.1544) by 0.019 — so my rebuild of the candidate config is
+  NOT a byte-perfect replica of the registry's confirm runs (torch/cuda/env drift,
+  or those runs carried extra fields). Therefore absolute numbers are NOT
+  comparable to the registry; only THIS session's own baseline-vs-candidate delta
+  (+0.0044, identical conditions) is trustworthy. That delta is the real signal.
+- *Not injected into the registry.* These runs bypassed the worker/confirm
+  pipeline and carry the caveat above, so writing them to Neon would pollute it.
+  Kept as an out-of-band finding.
+
+**Self-critique**
+- *I rebuilt the champion config by hand from the runs row instead of using the
+  real pipeline.* The 0.019 same-seed gap is the price — a faithful experiment must
+  come from the SAME config artifact the registry used, not a hand-reassembly. The
+  right fix is to run through `worker.py` (claim a real queue job whose `config`
+  carries the exact champion base), not `run_experiment.py` with a reconstructed
+  EXPERIMENT_CONFIG.
+- *The box has no champion.json* — `sync_champions.py` exists; it should be run on
+  the box (or the worker should pull the champion) so `run_experiment.py` is
+  faithful by default. This is the config-drift root cause.
+- *I didn't revive the heartbeat* (needs the worker + the box reaching the Mac API
+  over a reverse tunnel). So the dashboard still shows the box offline even though
+  it's up — a real gap between displayed and actual state.
+- *Burned ~20 min of GPU on three tiny runs.* Cheap (cents) and authorized, but the
+  first (bare) run was wasted on the champion.json bug I could have checked first.
+
+**Next moves (priority order)**
+1. **Run the candidate through the REAL pipeline** — `sync_champions.py` on the box
+   to write champion.json, then `worker.py once` against a properly-queued confirm
+   job, so the config is the registry's exact artifact (kills the 0.019 drift).
+   Only then is a paired delta registry-trustworthy.
+2. **Revive the box heartbeat** so the dashboard reflects reality (worker loop +
+   reverse tunnel from box → Mac API).
+3. **Freshness badge on /voidbase** — surface `stale`/`age_s` (small UI win).
+4. **Status filter on the Idea backlog**; **psycopg_pool** (root-cause DB fix).
+
+**System state:** box UP (RTX 3060, idle, both research tmux sessions exited
+clean). Queue empty (0 needs-run). Champion 6.172 stands; no real challenger after
+the frontier candidate collapsed to sub-band on paired test.
+
+---
+
 ## 2026-06-19 · /dashboard stale-while-revalidate + startup warm-up
 
 **Shipped** — voidbase `62dba4e`. Killed the cold-MISS hang that bit twice (the
