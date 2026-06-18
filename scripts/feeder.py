@@ -34,6 +34,9 @@ from db.conn import connect  # noqa: E402
 # POST /queue_items hash identically (re-exported here, like confirm_daemon
 # re-exports from voidcheck, so existing importers — enqueue.py — keep working).
 from voidconfig import content_hash  # noqa: E402,F401
+# Same plausibility guard the confirm daemon uses, so `--mode stack` can never
+# seed a pair from a forged single (e.g. a leaked val_loss 0.44) — one source.
+from voidcheck import is_implausible_win  # noqa: E402
 
 DEFAULT_REPO = Path("/Users/vukrosic/my-life/llm-research-kit-scaling")
 THREAD = "tiny1m3m"
@@ -73,6 +76,7 @@ def champion_base(repo: Path) -> dict:
         "fields": fields,
         "seed": champ.get("seed", 42),
         "champ_flags": set(champ.get("flags", [])),
+        "val": champ.get("val"),  # the bar `--mode stack` measures winners against
     }
 
 
@@ -83,6 +87,34 @@ def already_seen(conn) -> set[str]:
     cur.execute("select content_hash from queue_items where content_hash is not null")
     seen |= {r[0] for r in cur.fetchall()}
     return seen
+
+
+def winning_singles(conn, champ_val: float, candidates: list[str],
+                    top_k: int, min_margin: float) -> list[str]:
+    """The single-flag mechanisms that genuinely beat the champion — best-first.
+
+    A flag qualifies iff its best run beat the champion by >= `min_margin` AND the
+    result is PLAUSIBLE (not a forged/leaked metric). These are the levers worth
+    STACKING: a directed C(winners, 2) search is where a real >band win hides once
+    the singles plateau, vs blind C(all, 2) ≈ thousands of mostly-noise pairs."""
+    cand = set(candidates)
+    cur = conn.cursor()
+    cur.execute(
+        "select name, min(final_val_loss) from runs "
+        "where thread_name=%s and final_val_loss is not null group by name",
+        (THREAD,))
+    winners = []
+    for name, val in cur.fetchall():
+        if not name or name not in cand:  # real single structural lever only
+            continue
+        val = float(val)
+        if is_implausible_win(val, champ_val):  # reject leaks/forgeries at the source
+            continue
+        margin = champ_val - val
+        if margin >= min_margin:
+            winners.append((name, margin))
+    winners.sort(key=lambda x: -x[1])
+    return [n for n, _ in winners[:top_k]]
 
 
 def make_experiment(base: dict, flags: list[str]) -> dict:
@@ -111,7 +143,9 @@ def gen(base: dict, flags: list[str], mode: str):
     if mode == "single":
         for f in flags:
             yield make_experiment(base, [f])
-    elif mode == "pairs":
+    elif mode in ("pairs", "stack"):
+        # pairs = blind C(all, 2); stack = C(winners, 2) — same generator, the
+        # caller curates `flags` down to the proven winners for stack mode.
         for a, b in itertools.combinations(flags, 2):
             yield make_experiment(base, [a, b])
 
@@ -119,9 +153,16 @@ def gen(base: dict, flags: list[str], mode: str):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=str(DEFAULT_REPO))
-    ap.add_argument("--mode", choices=["single", "pairs"], default="single")
+    ap.add_argument("--mode", choices=["single", "pairs", "stack"], default="single",
+                    help="single=one flag; pairs=blind C(all,2); "
+                         "stack=directed C(proven winners,2)")
     ap.add_argument("--limit", type=int, default=20, help="max NEW rows to enqueue")
     ap.add_argument("--priority", type=int, default=0)
+    ap.add_argument("--top-k", type=int, default=8,
+                    help="[stack] how many best singles to stack (default 8)")
+    ap.add_argument("--min-margin", type=float, default=0.0,
+                    help="[stack] a single must beat the champion by >= this to "
+                         "seed a pair (default 0.0 = any genuine win)")
     ap.add_argument("--dry", action="store_true", help="show what would enqueue, write nothing")
     args = ap.parse_args()
     repo = Path(args.repo)
@@ -138,6 +179,24 @@ def main() -> int:
             "insert into threads (name, hypothesis, status) values (%s,'tiny1m3m search','active') "
             "on conflict (name) do nothing", (THREAD,))
         conn.commit()
+
+        if args.mode == "stack":
+            champ_val = base.get("val")
+            if champ_val is None:
+                print("[feeder] stack mode needs champion.json `val` — aborting",
+                      file=sys.stderr)
+                return 1
+            winners = winning_singles(conn, float(champ_val), flags,
+                                      args.top_k, args.min_margin)
+            if len(winners) < 2:
+                print(f"[feeder] stack: only {len(winners)} proven winner(s) over "
+                      f"the champion (need >=2 to pair) — nothing to stack",
+                      file=sys.stderr)
+                return 0
+            flags = winners  # gen() now yields C(winners, 2)
+            print(f"[feeder] stack: pairing {len(winners)} proven winners "
+                  f"({', '.join(w.replace('use_', '') for w in winners)})",
+                  file=sys.stderr)
 
         enqueued, skipped = 0, 0
         for exp in gen(base, flags, args.mode):
