@@ -67,6 +67,38 @@ class BeatsScreenTest(unittest.TestCase):
         self.assertFalse(vc.beats_screen(6.0, None))
 
 
+class IsImplausibleWinTest(unittest.TestCase):
+    def test_nonsense_low_loss_is_implausible(self):
+        # The live case: a 0.4388 run against a 6.172 champion — ~14x better,
+        # a broken/forged metric, must not auto-trigger a confirm.
+        self.assertTrue(vc.is_implausible_win(0.4388, 6.172))
+
+    def test_genuine_win_is_plausible(self):
+        # A real, even large, improvement clears it with margin (26% better).
+        self.assertFalse(vc.is_implausible_win(4.549, 6.172))
+        self.assertFalse(vc.is_implausible_win(5.015, 6.172))
+
+    def test_exactly_half_is_the_boundary(self):
+        # default factor 0.5: strictly-below is implausible, at-or-above is fine.
+        self.assertTrue(vc.is_implausible_win(3.0, 6.172))     # < 3.086
+        self.assertFalse(vc.is_implausible_win(3.086, 6.172))  # == boundary
+
+    def test_non_positive_loss_is_definitionally_broken(self):
+        self.assertTrue(vc.is_implausible_win(0.0, 6.0))
+        self.assertTrue(vc.is_implausible_win(-1.0, 6.0))
+
+    def test_cannot_assess_does_not_flag(self):
+        # Missing values, or a degenerate non-positive champion -> don't reject.
+        self.assertFalse(vc.is_implausible_win(None, 6.0))
+        self.assertFalse(vc.is_implausible_win(3.0, None))
+        self.assertFalse(vc.is_implausible_win(1.0, 0.0))
+
+    def test_factor_is_tunable(self):
+        # A stricter floor flags a smaller improvement; a looser one permits it.
+        self.assertTrue(vc.is_implausible_win(5.0, 6.172, max_drop_factor=0.9))
+        self.assertFalse(vc.is_implausible_win(0.4, 6.172, max_drop_factor=0.05))
+
+
 class PairedVerdictTest(unittest.TestCase):
     def test_candidate_better_at_all_seeds_agrees(self):
         v = vc.paired_verdict(_jobs([6.00, 6.01, 5.99], [6.10, 6.12, 6.08]), 0.001)

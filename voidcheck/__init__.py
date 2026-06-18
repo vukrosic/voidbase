@@ -11,6 +11,8 @@ Three primitives, all pure functions over plain values — no DB, no network:
   * is_paired(...)        — mirror of comparisons.is_paired: a delta is signal
                             ONLY when treatment and baseline share seed AND box.
   * beats_screen(...)     — the cheap single-seed screen gate.
+  * is_implausible_win(...) — the "too good to be true" floor that keeps a broken
+                            or forged nonsense-low loss off the confirm queue.
   * paired_verdict(...)   — the paired 3-seed sign-consistent AGREE rule that
                             promotes/rejects a candidate.
 
@@ -19,14 +21,16 @@ can be vendored anywhere a result needs checking.
 """
 from voidcheck.core import (  # noqa: F401
     CONFIRM_BAND,
+    MAX_DROP_FACTOR,
     SCREEN_BAND,
     SEEDS,
     beats_screen,
+    is_implausible_win,
     is_paired,
     paired_verdict,
 )
 
 __all__ = [
-    "SEEDS", "SCREEN_BAND", "CONFIRM_BAND",
-    "is_paired", "beats_screen", "paired_verdict",
+    "SEEDS", "SCREEN_BAND", "CONFIRM_BAND", "MAX_DROP_FACTOR",
+    "is_paired", "beats_screen", "is_implausible_win", "paired_verdict",
 ]
