@@ -1,7 +1,10 @@
 # Voidmind — the token-donor / idea loop (idea capture)
 
-> Status: **idea, not started.** Captured 2026-06-18. This is a standalone spoke,
-> built after Voidrunner. It is written down here so the design isn't lost.
+> Status: **idea, not started.** Captured 2026-06-18. A **write-client spoke**
+> (`voidmind/`, parallel to `runner/`), built after Voidcredit. Same kind as
+> Voidrunner — runs on a donor's box, HTTP + bearer token, extracts later; the
+> two donor clients likely share a small `voidclient` HTTP/auth core. Integration
+> map: [SPOKES.md](SPOKES.md).
 
 ## One line
 
