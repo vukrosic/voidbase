@@ -14,8 +14,13 @@ An experiment is a JSON of overrides on top of the champion. The feeder:
   5. enqueues the novel ones as needs-run rows the worker then drains.
 
   python3 scripts/feeder.py --limit 20            # single-flag levers
-  python3 scripts/feeder.py --mode pairs --limit 30 # combinatorial stacks (scale)
+  python3 scripts/feeder.py --mode pairs --limit 30 # blind C(all,2) (scale)
+  python3 scripts/feeder.py --mode stack --priority 6 # directed C(winners,2)
   python3 scripts/feeder.py --dry                  # show what WOULD enqueue
+
+`--mode stack` is the move once singles plateau: it pairs only the mechanisms
+that genuinely beat the champion (reusing voidcheck's plausibility guard), so
+the search spends GPU on combinations with real signal instead of 11k blind ones.
 """
 from __future__ import annotations
 
