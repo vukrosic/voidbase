@@ -1,10 +1,18 @@
-# Voidmind — the token-donor / idea loop (idea capture)
+# Voidmind — the token-donor / idea loop
 
-> Status: **idea, not started.** Captured 2026-06-18. A **write-client spoke**
-> (`voidmind/`, parallel to `runner/`), built after Voidcredit. Same kind as
-> Voidrunner — runs on a donor's box, HTTP + bearer token, extracts later; the
-> two donor clients likely share a small `voidclient` HTTP/auth core. Integration
-> map: [SPOKES.md](SPOKES.md).
+> Status: **BUILT** (2026-06-18), `voidmind/`. A **write-client spoke** parallel to
+> `runner/`: runs on a donor's box, HTTP + bearer token, stdlib + `voidconfig`
+> only, zero DB imports. The LLM call lives behind a swappable **proposer seam**
+> (`voidmind/propose.py`) so the donor's keys stay theirs and the core carries no
+> vendor SDK. Integration map: [SPOKES.md](SPOKES.md). Client usage:
+> [`voidmind/README.md`](../../voidmind/README.md).
+>
+> **What shipped:** the package (`core` protocol + `propose` seam + `cli`), the two
+> new API endpoints `POST /ideas` and `POST /queue_items` (bearer-token, born
+> low-trust), and **`voidconfig`** — a new pure lib that owns the config-row shape
+> and the dedup `content_hash`, imported by the API and re-exported by
+> `scripts/feeder` so a Voidmind row lands in the EXACT same dedup space as an
+> auto-fed one (this resolved the "config schema ownership" open question below).
 
 ## One line
 
@@ -57,16 +65,23 @@ Voidmind speaks only the voidbase API. It never touches the DB.
 6. sleep / repeat
 ```
 
-## Open design questions (defer until Voidrunner ships)
+## Design questions
 
-- **Idea quality gate.** Open token-donation invites spam/low-value ideas. Options:
-  maintainer-approves-before-enqueue, a cheap LLM-judge pre-filter, or
-  per-contributor enqueue rate limits. Decide when it's real, not now.
-- **Config schema ownership.** Voidmind must emit configs in the exact shape
-  `run_experiment.py` consumes. That schema should be pinned/versioned once
-  (shared by Voidrunner) so the idea-loop and the runner can't drift.
-- **Auth.** Same bearer-token scheme as Voidrunner (see VOIDRUNNER plan). A
-  Voidmind token grants `ideas`/`queue_items` write, nothing else.
+- **Config schema ownership.** ✓ **RESOLVED** — the config-row shape and the
+  dedup `content_hash` now live in the pure **`voidconfig`** lib, the single owner
+  imported by the API's `POST /queue_items` (authoritative hash + validation) and
+  re-exported by `scripts/feeder`. A test pins `voidconfig.content_hash` ==
+  `feeder.content_hash` so the idea-loop and the auto-feeder can't drift.
+- **Auth.** ✓ Same bearer-token scheme as Voidrunner. A Voidmind token grants
+  `ideas`/`queue_items` write, nothing else; the localhost dev-bypass still works
+  for the operator, and `VOIDBASE_REQUIRE_AUTH=1` closes it for public deploys.
+- **Idea quality gate.** *(still open — decide when spam is real.)* Open
+  token-donation invites low-value ideas. The trust floor already holds (a
+  proposal is born unclaimed/unverified and can never move the champion, so the
+  worst case is junk that loses its paired comparison). When volume warrants it,
+  add one of: maintainer-approve-before-enqueue, a cheap LLM-judge pre-filter, or
+  per-contributor enqueue rate limits. Not built yet — the gate belongs where the
+  spam appears, and there's none to measure against today.
 
 ## Relationship to existing code
 

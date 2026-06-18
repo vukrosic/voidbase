@@ -32,6 +32,9 @@ Endpoints (GET unless noted, JSON):
 
   POST /threads        author / update a research thread (dashboard)
   POST /box_heartbeat  {box_id, gpu_class?} liveness ping from a worker (PG-only)
+  POST /register       mint a contributor + bearer token (no auth; PG-only)
+  POST /claim /runs /release   Voidrunner compute-donor protocol (token; PG-only)
+  POST /ideas /queue_items     Voidmind token-donor protocol (token; PG-only)
 """
 from __future__ import annotations
 
@@ -50,6 +53,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from db.conn import database_url  # noqa: E402
 import voidcredit  # noqa: E402  — pure attribution/leaderboard policy (Postgres-only edges)
+import voidconfig  # noqa: E402  — pure config-row shape + authoritative dedup hash (Voidmind writes)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "registry" / "experiments.sqlite"
 
@@ -856,6 +860,85 @@ def release_job(body: dict, contributor_id: str) -> dict:
     return {"released": out[0]["id"]}
 
 
+# --- Voidmind: the token-donor write protocol (ideas + queue_items) ---------
+#
+# The server side of the idea-loop client (docs/VOIDMIND.md). Voidmind runs on a
+# token donor's box (their own LLM keys), reads open threads, and proposes work.
+# Like Voidrunner it holds no DB creds and authenticates with a bearer token, but
+# its writes are LOW-TRUST PROPOSALS, not results: an idea/queue_item can never
+# move the champion (that still goes through the confirm gate), so an open Voidmind
+# is safe — worst case is junk rows that never get claimed or lose their pairing.
+
+def create_idea(body: dict, contributor_id: str) -> dict:
+    """Record a candidate idea (proposed by this contributor). Pure backlog — an
+    idea is a note, not runnable; the runnable artifact is the queue_item. Title is
+    required; explanation/notes optional. Born status 'proposed'."""
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise ValueError("idea requires a 'title'")
+    idea_id = (body.get("id") or "").strip() or f"idea-{uuid.uuid4().hex[:12]}"
+    out = _pg_exec(
+        """insert into ideas (id, title, explanation, status, proposed_by, notes)
+           values (%s, %s, %s, 'proposed', %s, %s)
+           on conflict (id) do nothing
+           returning id, title, status, proposed_by, created_at""",
+        (idea_id, title, body.get("explanation"), contributor_id, body.get("notes")))
+    if not out:
+        raise ValueError(f"idea id already exists: {idea_id}")
+    return out[0]
+
+
+def enqueue_item(body: dict, contributor_id: str) -> dict:
+    """Enqueue a runnable experiment from a self-contained config (the donor's
+    idea, resolved). The SERVER owns the dedup key: it validates the config shape
+    and computes content_hash via voidconfig, so a client can neither submit a
+    malformed row nor dodge dedup with a forged hash. Born 'needs-run' and
+    unclaimed — Voidrunner drains it later, the result is born unverified.
+
+    Idempotent on the resolved config: if its content_hash is already a run or a
+    queue item, this is a no-op that reports {deduped: true} rather than a second
+    copy. The thread must already exist (a proposal attaches to an open thread)."""
+    thread = (body.get("thread") or body.get("thread_name") or "").strip()
+    if not thread:
+        raise ValueError("queue_items requires a 'thread' (an existing thread name)")
+    if not _pg_rows("select 1 from threads where name = %s", (thread,)):
+        raise ValueError(f"no such thread: {thread} (create or pick an existing one)")
+
+    config = voidconfig.validate_config(body.get("config"))
+    lever = (config.get("lever") or body.get("lever") or "idea").strip() or "idea"
+    chash = voidconfig.content_hash(config.get("env") or {}, config.get("fields") or {})
+
+    # Authoritative dedup: the same resolved config already run OR queued is a
+    # no-op. This is the same dedup space feeder/enqueue use (one indexed lookup).
+    seen = _pg_rows(
+        """select 'run' as where_ from runs where content_hash = %(h)s
+           union all
+           select 'queue' from queue_items where content_hash = %(h)s
+           limit 1""", {"h": chash})
+    if seen:
+        return {"deduped": True, "content_hash": chash, "where": seen[0]["where_"]}
+
+    qid = voidconfig.queue_item_id("mind", lever, chash)
+    name = voidconfig.queue_item_name(lever, chash)
+    priority = int(body.get("priority") or 0)
+    gpu_class = (body.get("gpu_class") or "any").strip() or "any"
+    out = _pg_exec(
+        """insert into queue_items
+             (id, thread_name, name, command, status, config, content_hash,
+              gpu_class, priority)
+           values (%s, %s, %s, 'python run_experiment.py', 'needs-run', %s, %s, %s, %s)
+           on conflict (id) do nothing
+           returning id, thread_name, name, status, content_hash, priority""",
+        (qid, thread, name, json.dumps(config), chash, gpu_class, priority))
+    if not out:
+        # id collided (same config raced in between the dedup check and here).
+        return {"deduped": True, "content_hash": chash, "queue_item_id": qid}
+    row = out[0]
+    return {"deduped": False, "queue_item_id": row["id"], "content_hash": chash,
+            "thread_name": row["thread_name"], "name": row["name"],
+            "status": row["status"], "priority": row["priority"]}
+
+
 ROUTES = {
     "/health": health,
     "/activity": activity,
@@ -918,6 +1001,9 @@ class Handler(BaseHTTPRequestHandler):
             - claim the next job                  (/claim)
             - report a finished run               (/runs)
             - release a claimed job               (/release)
+          * Voidmind token-donor protocol (bearer token; localhost bypass):
+            - propose a candidate idea            (/ideas)
+            - enqueue a runnable experiment       (/queue_items)
 
         Dispatch is by URL path; a client may instead POST the base URL with a
         {resource: '...'} field in the body (the worker sends {resource:
@@ -932,7 +1018,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         resource = path.lstrip("/") or str(body.get("resource") or "")
         # Endpoints that require a contributor identity (token, or localhost bypass).
-        authed = {"claim", "runs", "release"}
+        #   claim/runs/release — Voidrunner (compute);  ideas/queue_items — Voidmind (proposals)
+        authed = {"claim", "runs", "release", "ideas", "queue_items"}
         writable = {"threads", "box_heartbeat", "register"} | authed
         if resource not in writable:
             self._send(404, {"error": "not found", "writable": sorted(writable)})
@@ -946,7 +1033,8 @@ class Handler(BaseHTTPRequestHandler):
                 if cid is None:
                     return  # 401 already sent
                 handler = {"claim": claim_job, "runs": report_run,
-                           "release": release_job}[resource]
+                           "release": release_job, "ideas": create_idea,
+                           "queue_items": enqueue_item}[resource]
                 self._send(200, handler(body, cid))
             elif resource == "register":
                 self._send(200, register(body))
