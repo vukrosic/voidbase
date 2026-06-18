@@ -99,25 +99,80 @@ def current_champion(conn, scope: str) -> dict | None:
 
 # --- candidate selection -----------------------------------------------------
 
-def candidates(conn, champ_val: float, screen_band: float) -> list[dict]:
-    """`done`, still-`unverified` runs that beat the pinned champion by more than
-    the screen band — and are not themselves confirm-arm runs (those carry a
-    `confirm-*` queue_item_id; without this filter a winning candidate-arm re-run
-    would be picked up as a fresh candidate and the daemon would confirm forever)."""
+def candidates(conn, scope: str, champ_val: float, screen_band: float) -> list[dict]:
+    """`done`, still-`unverified` runs ON THIS SCOPE'S THREAD that beat the pinned
+    champion by more than the screen band — and are not themselves confirm-arm runs
+    (those carry a `confirm-*` queue_item_id; without this filter a winning
+    candidate-arm re-run would be picked up as a fresh candidate and the daemon
+    would confirm forever).
+
+    The `thread_name = scope` filter is essential: val_loss is only comparable
+    WITHIN a research question. Without it the gate pulls runs from unrelated
+    threads (e.g. a `lr_schedule` 10M-token study at 4.55, a `layerscale` run at
+    5.54) and tries to 'confirm' them against the tiny1m3m champion — apples to
+    oranges, a false confirmation. A challenger to a scope's champion must be a run
+    attempting that same scope."""
     cur = conn.cursor()
     cur.execute(
         """select r.id, r.thread_name, r.name, r.config, r.final_val_loss, r.box_id
            from runs r
-           where r.status = 'done'
+           where r.thread_name = %s
+             and r.status = 'done'
              and r.verification = 'unverified'
              and r.final_val_loss is not null
              and r.final_val_loss < %s - %s
              and (r.queue_item_id is null or r.queue_item_id not like 'confirm-%%')
              and not exists (select 1 from confirmations cf where cf.run_id = r.id)
            order by r.final_val_loss asc""",
-        (champ_val, screen_band))
+        (scope, champ_val, screen_band))
     return [{"id": r[0], "thread_name": r[1], "name": r[2], "config": r[3],
              "final_val_loss": r[4], "box_id": r[5]} for r in cur.fetchall()]
+
+
+def near_misses(conn, scope: str, champ_val: float, max_drop_factor: float) -> dict:
+    """The 'why is the gate idle?' report: plausible done+unverified runs ON THIS
+    SCOPE'S THREAD that beat the champion's RAW val but by less than the screen band
+    — improvements the cheap single-seed screen can't tell from noise. Same
+    `thread_name = scope` scoping as candidates(), so the report describes exactly
+    the population the gate judges. Without this a plateaued search makes the daemon
+    look broken (silent) when it is in fact correct (no decisive contender)."""
+    cur = conn.cursor()
+    cur.execute(
+        """select r.id, r.final_val_loss
+           from runs r
+           where r.thread_name = %s
+             and r.status='done' and r.verification='unverified'
+             and r.final_val_loss is not null
+             and r.final_val_loss < %s                  -- beats champion raw
+             and r.final_val_loss >= %s                 -- plausible (not nonsense-low)
+             and (r.queue_item_id is null or r.queue_item_id not like 'confirm-%%')
+             and not exists (select 1 from confirmations cf where cf.run_id = r.id)
+           order by r.final_val_loss asc""",
+        (scope, champ_val, champ_val * max_drop_factor))
+    rows = cur.fetchall()
+    if not rows:
+        return {"beat_raw": 0, "closest_id": None, "closest_val": None,
+                "closest_margin": None, "band_to_admit": None}
+    top_id, top_val = rows[0]
+    margin = champ_val - top_val
+    return {"beat_raw": len(rows), "closest_id": top_id, "closest_val": top_val,
+            "closest_margin": margin,
+            # the band that would admit the top candidate sits just under its margin
+            "band_to_admit": round(max(margin - 1e-6, 0.0), 6)}
+
+
+def log_plateau(report: dict, champ_val: float, screen_band: float) -> None:
+    """Turn an idle cycle into a legible signal instead of silence."""
+    if report["beat_raw"] == 0:
+        log(f"idle: no plausible run beats champion {champ_val:.4f} — the search has "
+            f"no contender yet; nothing to confirm (correct, not a fault).")
+        return
+    log(f"PLATEAU: {report['beat_raw']} run(s) beat champion {champ_val:.4f} on raw "
+        f"val but NONE clear the {screen_band} screen band. Closest: "
+        f"{report['closest_id']} at {report['closest_val']:.4f} "
+        f"(+{report['closest_margin']:.4f}). To admit it to a paired confirm, run with "
+        f"--screen-band {report['band_to_admit']:.4f}; otherwise the search needs a "
+        f"decisively better idea, not another confirm.")
 
 
 # --- confirm queue items (in-flight detection + collection) ------------------
@@ -255,9 +310,13 @@ def poll_cycle(conn, args, contributor_id: str) -> dict:
     if champ["config"] is None:
         log(f"champion run {champ['run_id']} has no config — cannot build a "
             f"baseline arm without falling back to the bare base; skipping cycle")
+        # Still tell the operator WHERE the field stands, so a config-less champion
+        # doesn't read as a dead daemon.
+        log_plateau(near_misses(conn, args.scope, champ["val_loss"], args.max_drop_factor),
+                    champ["val_loss"], args.screen_band)
         return {"candidates": 0, "enqueued": 0, "judged": 0, "skipped_implausible": 0}
 
-    cand = candidates(conn, champ["val_loss"], args.screen_band)
+    cand = candidates(conn, args.scope, champ["val_loss"], args.screen_band)
     enqueued, judged, skipped_implausible = 0, 0, 0
     for c in cand:
         # "Too good to be true" floor: a broken or forged nonsense-low val_loss
@@ -298,6 +357,12 @@ def poll_cycle(conn, args, contributor_id: str) -> dict:
         # surface is wired; it must never promote.
         log("--auto-promote is a stub and does nothing — promotion stays a "
             "maintainer action")
+
+    # Nothing moved this cycle: say WHY (search plateaued vs no contender) instead
+    # of going silent, which reads as a broken daemon.
+    if enqueued == 0 and judged == 0 and skipped_implausible == 0:
+        log_plateau(near_misses(conn, args.scope, champ["val_loss"], args.max_drop_factor),
+                    champ["val_loss"], args.screen_band)
 
     return {"candidates": len(cand), "enqueued": enqueued, "judged": judged,
             "skipped_implausible": skipped_implausible}
