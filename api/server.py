@@ -36,6 +36,11 @@ Endpoints (GET unless noted, JSON):
   POST /register       mint a contributor + bearer token (no auth; PG-only)
   POST /claim /runs /release   Voidrunner compute-donor protocol (token; PG-only)
   POST /ideas /queue_items     Voidmind token-donor protocol (token; PG-only)
+
+NOTE on query-param ids: run ids contain '+' (e.g. 'use_a+use_b-...'). In a query
+string '+' is form-decoded to a space, so a RAW url 404s — callers MUST percent-
+encode the value ('+' -> '%2B'). The voidspark proxy does this (encodeURIComponent);
+a hand-rolled curl/script to /lineage?run= or /eval?run_id= must too.
 """
 from __future__ import annotations
 

@@ -7,6 +7,57 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Per-run lineage breadcrumb (deferred 5 fires — done)
+
+**Shipped** — voidspark `3255b53`. The `/lineage?run=` chain (thread → queue_item
+→ run → champion, voidcredit-derived) existed but rendered nowhere — deferred
+behind higher-narrative work for five straight fires. Now every run row on
+`/voidbase` is expandable (was: only `has_eval` rows); expanding fetches the
+lineage for ANY run plus the learning curve when present, each cached. New
+`<LineageBreadcrumb>` renders the chain as a horizontal breadcrumb with per-kind
+icons; the champion link is gold (trophy).
+
+**Tested** — Chrome: a normal run (`use_canon_conv+use_av_output_carry`) shows
+thread → queued-lever → run; the confirmed champion (`323-mom0p90-lr2x`) shows
+thread → run → CURRENT CHAMPION (gold trophy). Zero console errors, typecheck clean.
+
+**Found a latent bug (didn't ship a fix — the client is already correct):** run
+ids contain `+`. A raw query string (`/lineage?run=...+...`) is decoded by the
+server's `parse_qs` as `+`→space, so the lookup 404s — I hit this with curl. The
+voidspark proxy uses `encodeURIComponent` (`+`→`%2B`), so the React client is
+safe, which the live test confirmed (the `+`-containing run resolved correctly).
+The server behavior is spec-correct (form-encoding), so the fix belongs at the
+caller, not the server. *But:* any non-encoding consumer (a manual curl, a naive
+script hitting `/lineage` or `/eval`) silently 404s on `+`/space ids. Worth a
+one-line note in the API docstring; logged below.
+
+**Self-critique**
+- *The breadcrumb is read-only — no navigation.* Clicking the `champion` node could
+  jump to that champion in the lineage timeline, or the thread node could filter
+  the runs table. Right now it's informational only. Fine as a first cut.
+- *Two fetches per expand (lineage + eval) and they serialize at the DB layer*
+  (one Neon connection under `_pg_lock`). For a run with eval that's two ~0.3–1s
+  round-trips back-to-back. Acceptable (only on explicit expand, both cached), but
+  a combined `/lineage` that also returns eval would halve it. Low priority.
+- *I made EVERY row expandable, including the `confirm-*` paired-seed rows* whose
+  lineage is shallow (often just thread → run). Not wrong, but those 16 rows add
+  little; they could collapse into their parent candidate. A later grouping pass.
+- *No unit test* (consistent with the repo's testless voidspark components), so the
+  breadcrumb's correctness rests on the manual Chrome pass alone.
+
+**Next moves (priority order)**
+1. **One-line API docstring note** on the `+`/space query-encoding gotcha for
+   `/lineage` + `/eval` (cheap, prevents the next curl-debugging detour).
+2. **Run the outcome-aware Voidmind proposer for real** — needs an LLM key; would
+   replace the "(fed from Neon queue)" idea placeholders with real proposals.
+3. **Status filter on the Idea backlog** — cheap, high-utility once volume is browsed.
+4. **Background-refresh /dashboard** — hides the cold-MISS latency (the BrokenPipe
+   from last fire + the "Loading…" wait this fire both came from it).
+5. **Get a GPU box back** — `.env` box coords are now EMPTY (box torn down), so
+   compute is fully blocked; every research payoff above waits on this.
+
+---
+
 ## 2026-06-19 · Idea backlog panel — surface the proposal stream
 
 **Shipped** — voidbase `4b8c9d9`, voidspark `1e0244f`. The `/ideas` backlog (167
