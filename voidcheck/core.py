@@ -14,8 +14,12 @@ import statistics as _st
 SEEDS = (42, 123, 7)
 
 # Screen band: a candidate must beat the PINNED champion by more than this on the
-# cheap single-seed screen before any GPU is spent on a 6-run confirm.
-SCREEN_BAND = 0.02
+# cheap single-seed screen before any GPU is spent on a 6-run confirm. THIS is the
+# single source of truth for the band — the daemon's --screen-band default, the
+# docs, and every report derive from it; never hard-code the number elsewhere.
+# Tightened 0.02 -> 0.01 (2026-06-18) so smaller-but-real improvements reach the
+# more-sensitive paired 3-seed confirm instead of being rejected as screen noise.
+SCREEN_BAND = 0.01
 
 # Confirm band: the paired 3-seed mean must beat the freshly re-run champion by
 # more than this epsilon AND favour the candidate at all 3 seeds to AGREE. The

@@ -77,7 +77,8 @@ experiments/week. `scripts/confirm_daemon.py` automates the *queueing* of
 confirms (a human still promotes):
 
 1. Polls Neon for `done`, still-`unverified` runs whose `final_val_loss` beats
-   the **current champion** by more than the screen band (`0.02`).
+   the **current champion** by more than the screen band (`voidcheck.SCREEN_BAND`,
+   currently `0.01`).
 2. For each fresh candidate it enqueues a **paired 3-seed confirm** — 3 candidate
    runs + 3 champion-baseline runs at matched seeds (42 / 123 / 7) — as
    `queue_items` the worker drains. It never double-enqueues.
@@ -95,7 +96,7 @@ human in the loop even at scale. `--auto-promote` exists but is a no-op stub.
 ```bash
 python3 scripts/confirm_daemon.py --once          # one poll cycle, then exit
 python3 scripts/confirm_daemon.py --interval 60   # poll loop (default 60s)
-python3 scripts/confirm_daemon.py --once --scope tiny1m3m --screen-band 0.02
+python3 scripts/confirm_daemon.py --once --scope tiny1m3m   # --screen-band defaults to voidcheck.SCREEN_BAND (0.01)
 ```
 
 Needs `DATABASE_URL` (Neon) configured — see `db/conn.py`.

@@ -129,13 +129,14 @@ def candidates(conn, scope: str, champ_val: float, screen_band: float) -> list[d
              "final_val_loss": r[4], "box_id": r[5]} for r in cur.fetchall()]
 
 
-def near_misses(conn, scope: str, champ_val: float, max_drop_factor: float) -> dict:
-    """The 'why is the gate idle?' report: plausible done+unverified runs ON THIS
-    SCOPE'S THREAD that beat the champion's RAW val but by less than the screen band
-    — improvements the cheap single-seed screen can't tell from noise. Same
-    `thread_name = scope` scoping as candidates(), so the report describes exactly
-    the population the gate judges. Without this a plateaued search makes the daemon
-    look broken (silent) when it is in fact correct (no decisive contender)."""
+def gate_field(conn, scope: str, champ_val: float, screen_band: float,
+               max_drop_factor: float) -> dict:
+    """A snapshot of the candidate field for one scope: plausible done+unverified
+    runs ON THIS SCOPE'S THREAD that beat the champion's RAW val, SPLIT by whether
+    they clear the screen band. Same scoping/plausibility filters as candidates(),
+    so it describes exactly the population the gate judges. Lets an idle daemon say
+    precisely WHY: contenders that clear the band vs sub-band near-misses vs nothing
+    at all."""
     cur = conn.cursor()
     cur.execute(
         """select r.id, r.final_val_loss
@@ -150,29 +151,39 @@ def near_misses(conn, scope: str, champ_val: float, max_drop_factor: float) -> d
            order by r.final_val_loss asc""",
         (scope, champ_val, champ_val * max_drop_factor))
     rows = cur.fetchall()
-    if not rows:
-        return {"beat_raw": 0, "closest_id": None, "closest_val": None,
-                "closest_margin": None, "band_to_admit": None}
-    top_id, top_val = rows[0]
-    margin = champ_val - top_val
-    return {"beat_raw": len(rows), "closest_id": top_id, "closest_val": top_val,
-            "closest_margin": margin,
-            # the band that would admit the top candidate sits just under its margin
-            "band_to_admit": round(max(margin - 1e-6, 0.0), 6)}
+    clears = [(i, v) for (i, v) in rows if (champ_val - v) > screen_band]
+    sub = [(i, v) for (i, v) in rows if (champ_val - v) <= screen_band]
+    return {"beat_raw": len(rows), "clears": clears,
+            "closest_sub": sub[0] if sub else None}
 
 
-def log_plateau(report: dict, champ_val: float, screen_band: float) -> None:
-    """Turn an idle cycle into a legible signal instead of silence."""
-    if report["beat_raw"] == 0:
-        log(f"idle: no plausible run beats champion {champ_val:.4f} — the search has "
-            f"no contender yet; nothing to confirm (correct, not a fault).")
+def log_field(field: dict, champ_val: float, screen_band: float,
+              *, champion_has_config: bool) -> None:
+    """Turn an idle cycle into a legible signal instead of silence, naming the
+    real blocker: a missing champion config vs a plateaued search vs no contender."""
+    if field["clears"]:
+        top_id, top_val = field["clears"][0]
+        n = len(field["clears"])
+        if champion_has_config:
+            log(f"{n} candidate(s) clear the {screen_band} band; closest {top_id} at "
+                f"{top_val:.4f} (+{champ_val - top_val:.4f}) — enqueuing/awaiting confirm.")
+        else:
+            log(f"{n} candidate(s) CLEAR the {screen_band} band (closest {top_id} at "
+                f"{top_val:.4f}, +{champ_val - top_val:.4f}) and WOULD be confirmed — but "
+                f"the champion run has no config to build the baseline arm. The blocker "
+                f"is the champion config, NOT the science: point the champion at a real "
+                f"config-carrying run to unblock.")
         return
-    log(f"PLATEAU: {report['beat_raw']} run(s) beat champion {champ_val:.4f} on raw "
-        f"val but NONE clear the {screen_band} screen band. Closest: "
-        f"{report['closest_id']} at {report['closest_val']:.4f} "
-        f"(+{report['closest_margin']:.4f}). To admit it to a paired confirm, run with "
-        f"--screen-band {report['band_to_admit']:.4f}; otherwise the search needs a "
-        f"decisively better idea, not another confirm.")
+    if field["closest_sub"]:
+        sid, sval = field["closest_sub"]
+        margin = champ_val - sval
+        log(f"PLATEAU: {field['beat_raw']} run(s) beat champion {champ_val:.4f} on raw "
+            f"val but NONE clear the {screen_band} band. Closest: {sid} at {sval:.4f} "
+            f"(+{margin:.4f}). Admit it with --screen-band {max(margin - 1e-6, 0.0):.4f}, "
+            f"or the search needs a decisively better idea, not another confirm.")
+        return
+    log(f"idle: no plausible run beats champion {champ_val:.4f} — no contender yet "
+        f"(correct, not a fault).")
 
 
 # --- confirm queue items (in-flight detection + collection) ------------------
@@ -311,9 +322,10 @@ def poll_cycle(conn, args, contributor_id: str) -> dict:
         log(f"champion run {champ['run_id']} has no config — cannot build a "
             f"baseline arm without falling back to the bare base; skipping cycle")
         # Still tell the operator WHERE the field stands, so a config-less champion
-        # doesn't read as a dead daemon.
-        log_plateau(near_misses(conn, args.scope, champ["val_loss"], args.max_drop_factor),
-                    champ["val_loss"], args.screen_band)
+        # doesn't read as a dead daemon — and name the real blocker (the config).
+        log_field(gate_field(conn, args.scope, champ["val_loss"], args.screen_band,
+                             args.max_drop_factor),
+                  champ["val_loss"], args.screen_band, champion_has_config=False)
         return {"candidates": 0, "enqueued": 0, "judged": 0, "skipped_implausible": 0}
 
     cand = candidates(conn, args.scope, champ["val_loss"], args.screen_band)
@@ -359,10 +371,12 @@ def poll_cycle(conn, args, contributor_id: str) -> dict:
             "maintainer action")
 
     # Nothing moved this cycle: say WHY (search plateaued vs no contender) instead
-    # of going silent, which reads as a broken daemon.
+    # of going silent, which reads as a broken daemon. Champion has a config here
+    # (we passed the early return), so any band-clearing run was already enqueued.
     if enqueued == 0 and judged == 0 and skipped_implausible == 0:
-        log_plateau(near_misses(conn, args.scope, champ["val_loss"], args.max_drop_factor),
-                    champ["val_loss"], args.screen_band)
+        log_field(gate_field(conn, args.scope, champ["val_loss"], args.screen_band,
+                             args.max_drop_factor),
+                  champ["val_loss"], args.screen_band, champion_has_config=True)
 
     return {"candidates": len(cand), "enqueued": enqueued, "judged": judged,
             "skipped_implausible": skipped_implausible}

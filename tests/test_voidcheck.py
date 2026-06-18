@@ -50,11 +50,20 @@ class IsPairedTest(unittest.TestCase):
 
 
 class BeatsScreenTest(unittest.TestCase):
+    # Expressed RELATIVE to vc.SCREEN_BAND so the test can never drift from the
+    # single source of truth: a margin comfortably over/under the band, whatever
+    # the band currently is.
     def test_clear_win_passes(self):
-        self.assertTrue(vc.beats_screen(6.00, 6.10))  # 0.10 > 0.02 band
+        champ = 6.10
+        self.assertTrue(vc.beats_screen(champ - vc.SCREEN_BAND * 5, champ))
 
     def test_sub_band_margin_fails(self):
-        self.assertFalse(vc.beats_screen(6.095, 6.10))  # 0.005 < 0.02 band
+        champ = 6.10
+        self.assertFalse(vc.beats_screen(champ - vc.SCREEN_BAND * 0.5, champ))
+
+    def test_just_over_band_passes(self):
+        champ = 6.10
+        self.assertTrue(vc.beats_screen(champ - vc.SCREEN_BAND * 1.5, champ))
 
     def test_equal_fails(self):
         self.assertFalse(vc.beats_screen(6.10, 6.10))
