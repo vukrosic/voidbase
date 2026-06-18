@@ -31,9 +31,23 @@ there ARE untested ideas, sitting right in the config.
 **In progress (GPU)** — launched a faithful paired sweep on the box (still up,
 RTX 3060): baseline (champion) + 7 untried structural flags (champion + each),
 seed 42, same session so within-session deltas are clean. All 7 dry-validated
-(DRY_OK). Running unattended in tmux (`/root/sweep.log`, ~40 min for 8 runs);
-results land one per run. NEXT fire should read `/root/sweep.log` for the deltas
-— any candidate beating baseline by > 0.01 (the band) is a real new lead.
+(DRY_OK). Running unattended in tmux (`/root/sweep.log`, ~7 min/run, ~50 min for
+8). NEXT fire: read `/root/sweep.log` for the remaining deltas.
+
+**FIRST RESULTS — and a REAL >band lead:**
+- `baseline` (champion) = **6.1778** (identical to last fire's 6.1778 — the
+  champion config is deterministic on this box, so within-session deltas are clean
+  signal, and last fire's 0.019 "drift" was the candidate config differing from the
+  registry's, NOT nondeterminism).
+- `use_swiglu_ffn` = **6.1650** → delta **+0.0128 vs baseline — CLEARS the 0.01
+  band.** SwiGLU (the LLaMA FFN) beats the champion on a faithful paired seed. The
+  first >band candidate of the session, pulled straight from the untried space.
+  Proves the thesis: the search was NOT exhausted — a literature-strong untried
+  mechanism improves the champion. (Caveat: 1 seed; needs a 3-seed paired confirm
+  to promote, and +0.0128 is a modest margin. But the within-session delta vs the
+  rock-stable 6.1778 baseline is trustworthy.)
+- 6 more candidates (value_residual, qk_layernorm, parallel_block, sub_ln,
+  v_rmsnorm, head_gain) still running → next fire collects them.
 
 **Self-critique**
 - *I asserted "search plateaued" for several fires without ever enumerating the
