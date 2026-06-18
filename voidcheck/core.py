@@ -1,0 +1,86 @@
+"""voidcheck/core.py — the integrity primitives (pure; stdlib only).
+
+Everything here is a function of its arguments with no side effects, so it is
+trivially testable and safe to vendor. The values below are the platform's
+validated trust policy (operator, 2026-06-17); they live here, once.
+"""
+from __future__ import annotations
+
+import statistics as _st
+
+# The three seeds a paired confirm runs on BOTH arms. Same seeds on candidate and
+# champion-baseline so the only thing that differs is the lever under test
+# (matches prior art's validated 42/123/7).
+SEEDS = (42, 123, 7)
+
+# Screen band: a candidate must beat the PINNED champion by more than this on the
+# cheap single-seed screen before any GPU is spent on a 6-run confirm.
+SCREEN_BAND = 0.02
+
+# Confirm band: the paired 3-seed mean must beat the freshly re-run champion by
+# more than this epsilon AND favour the candidate at all 3 seeds to AGREE. The
+# paired same-batch design + 3/3 sign agreement is the noise floor, not a band.
+CONFIRM_BAND = 0.001
+
+
+def is_paired(seed, box_id, baseline_seed, baseline_box_id) -> bool:
+    """Mirror of the comparisons.is_paired GENERATED column: a delta is trustworthy
+    signal ONLY when treatment and baseline share the same seed AND the same box,
+    with all four values present.
+
+    This is the single most important rule on the platform — going multi-writer on
+    heterogeneous GPUs makes seed/box noise worse, so an unpaired delta is noise,
+    not a result. Having it here (not only as a DB column) lets any client or
+    auditor check pairing without the database. box ids compare by string so a
+    uuid object and its text form match."""
+    if seed is None or box_id is None or baseline_seed is None or baseline_box_id is None:
+        return False
+    return seed == baseline_seed and str(box_id) == str(baseline_box_id)
+
+
+def beats_screen(candidate_val, champion_val, band: float = SCREEN_BAND) -> bool:
+    """The cheap screen gate: a candidate clears it iff it beats the champion by
+    MORE than `band` (lower val_loss is better). Equality or a smaller margin does
+    not clear it — that margin is inside the noise the band exists to reject."""
+    if candidate_val is None or champion_val is None:
+        return False
+    return (champion_val - candidate_val) > band
+
+
+def paired_verdict(jobs: list[dict], confirm_band: float = CONFIRM_BAND,
+                   seeds=SEEDS) -> dict:
+    """The paired-delta judgement (pure). `jobs` are the collected confirm runs,
+    each {arm: 'cand'|'base', seed, val} (val may be None for a failed run).
+
+    Paired delta = candidate mean − champion mean over the MATCHED seeds (negative
+    = candidate improves). AGREE iff we have all matched pairs, the mean beats the
+    band, AND every seed individually favours the candidate — sign-consistency is
+    the noise floor that a lucky single seed can't fake. Returns
+    {agrees, delta, cand_mean, n_pairs, notes}."""
+    by_key = {(j["arm"], j["seed"]): j for j in jobs}
+    pairs = []  # (seed, cand_val, base_val)
+    for seed in seeds:
+        c = by_key.get(("cand", seed))
+        b = by_key.get(("base", seed))
+        if c and b and c["val"] is not None and b["val"] is not None:
+            pairs.append((seed, c["val"], b["val"]))
+
+    if not pairs:
+        return {"agrees": False, "delta": None, "cand_mean": None, "n_pairs": 0,
+                "notes": ("confirm produced no paired vals — all runs failed or "
+                          "crashed; cannot reproduce, rejecting.")}
+
+    cand_mean = _st.mean(cv for _, cv, _ in pairs)
+    base_mean = _st.mean(bv for _, _, bv in pairs)
+    delta = cand_mean - base_mean
+    all_favor = all(cv < bv for _, cv, bv in pairs)
+    complete = len(pairs) == len(seeds)
+    agrees = complete and all_favor and (delta < -confirm_band)
+    rows = "; ".join(f"s{s}: {cv:.4f} vs {bv:.4f} (Δ{cv - bv:+.4f})"
+                     for s, cv, bv in pairs)
+    notes = (f"paired {len(pairs)}/{len(seeds)} seeds | cand mean {cand_mean:.4f} "
+             f"vs champ {base_mean:.4f} | Δ {delta:+.4f} | "
+             f"sign {sum(cv < bv for _, cv, bv in pairs)}/{len(pairs)} favour candidate | "
+             f"band {confirm_band} | {rows}")
+    return {"agrees": agrees, "delta": delta, "cand_mean": cand_mean,
+            "n_pairs": len(pairs), "notes": notes}

@@ -1,0 +1,133 @@
+"""Tests for voidcheck — the result-integrity library.
+
+These guard the rules past bugs slipped through: a delta is only signal when it's
+paired (same seed AND box), the screen gate rejects sub-band margins, and a
+candidate only AGREEs with all seeds present, the mean past the band, and every
+seed individually favouring it. Pure functions, so no DB / network needed.
+"""
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import voidcheck as vc  # noqa: E402
+
+
+def _jobs(cand, base, seeds=vc.SEEDS):
+    jobs = []
+    for seed, val in zip(seeds, cand):
+        jobs.append({"arm": "cand", "seed": seed, "val": val})
+    for seed, val in zip(seeds, base):
+        jobs.append({"arm": "base", "seed": seed, "val": val})
+    return jobs
+
+
+class IsPairedTest(unittest.TestCase):
+    def test_same_seed_same_box_is_paired(self):
+        self.assertTrue(vc.is_paired(42, "boxA", 42, "boxA"))
+
+    def test_uuid_object_matches_its_text_form(self):
+        import uuid
+        u = uuid.uuid4()
+        self.assertTrue(vc.is_paired(7, u, 7, str(u)))
+
+    def test_different_seed_not_paired(self):
+        self.assertFalse(vc.is_paired(42, "boxA", 123, "boxA"))
+
+    def test_different_box_not_paired(self):
+        self.assertFalse(vc.is_paired(42, "boxA", 42, "boxB"))
+
+    def test_any_null_not_paired(self):
+        # The fake-NULL bug: a missing seed or box must never read as paired.
+        self.assertFalse(vc.is_paired(None, "boxA", None, "boxA"))
+        self.assertFalse(vc.is_paired(42, None, 42, None))
+        self.assertFalse(vc.is_paired(42, "boxA", None, "boxA"))
+        self.assertFalse(vc.is_paired(42, "boxA", 42, None))
+
+
+class BeatsScreenTest(unittest.TestCase):
+    def test_clear_win_passes(self):
+        self.assertTrue(vc.beats_screen(6.00, 6.10))  # 0.10 > 0.02 band
+
+    def test_sub_band_margin_fails(self):
+        self.assertFalse(vc.beats_screen(6.095, 6.10))  # 0.005 < 0.02 band
+
+    def test_equal_fails(self):
+        self.assertFalse(vc.beats_screen(6.10, 6.10))
+
+    def test_worse_fails(self):
+        self.assertFalse(vc.beats_screen(6.20, 6.10))
+
+    def test_null_fails(self):
+        self.assertFalse(vc.beats_screen(None, 6.10))
+        self.assertFalse(vc.beats_screen(6.0, None))
+
+
+class PairedVerdictTest(unittest.TestCase):
+    def test_candidate_better_at_all_seeds_agrees(self):
+        v = vc.paired_verdict(_jobs([6.00, 6.01, 5.99], [6.10, 6.12, 6.08]), 0.001)
+        self.assertTrue(v["agrees"])
+        self.assertEqual(v["n_pairs"], 3)
+        expected = (6.00 + 6.01 + 5.99) / 3 - (6.10 + 6.12 + 6.08) / 3
+        self.assertAlmostEqual(v["delta"], expected, places=9)
+
+    def test_mixed_sign_fails_sign_consistency(self):
+        # Better on the mean but loses one seed -> not confirmed (the lucky-seed guard).
+        v = vc.paired_verdict(_jobs([6.00, 6.20, 5.90], [6.10, 6.12, 6.08]), 0.001)
+        self.assertFalse(v["agrees"])
+        self.assertLess(v["delta"], 0)
+
+    def test_candidate_worse_rejects(self):
+        v = vc.paired_verdict(_jobs([6.20, 6.21, 6.19], [6.10, 6.12, 6.08]), 0.001)
+        self.assertFalse(v["agrees"])
+        self.assertGreater(v["delta"], 0)
+
+    def test_incomplete_pairs_never_agree(self):
+        # Only 2 of 3 seeds produced a paired val -> not complete -> reject even if
+        # both favour the candidate.
+        jobs = _jobs([6.00, 6.01], [6.10, 6.12], seeds=(42, 123))
+        v = vc.paired_verdict(jobs, 0.001)
+        self.assertEqual(v["n_pairs"], 2)
+        self.assertFalse(v["agrees"])
+
+    def test_all_failed_runs_reject(self):
+        jobs = _jobs([None, None, None], [None, None, None])
+        v = vc.paired_verdict(jobs, 0.001)
+        self.assertEqual(v["n_pairs"], 0)
+        self.assertFalse(v["agrees"])
+        self.assertIsNone(v["delta"])
+
+    def test_within_band_does_not_agree(self):
+        # Favours candidate at all seeds but the mean margin is inside the band.
+        v = vc.paired_verdict(_jobs([6.0995, 6.0995, 6.0995],
+                                    [6.1000, 6.1000, 6.1000]), 0.001)
+        self.assertFalse(v["agrees"])  # 0.0005 margin < 0.001 band
+
+
+class PureLibraryTest(unittest.TestCase):
+    """voidcheck must stay pure: no DB / network / filesystem imports, so it can be
+    vendored anywhere a result needs checking."""
+
+    FORBIDDEN_ROOTS = ("psycopg", "db", "socket", "urllib", "requests", "subprocess")
+
+    def test_no_io_imports(self):
+        import ast
+        offenders = []
+        for py in (ROOT / "voidcheck").glob("*.py"):
+            tree = ast.parse(py.read_text())
+            roots = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    roots.update(a.name.split(".")[0] for a in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    roots.add(node.module.split(".")[0])
+            offenders += [f"{py.name}: {b}" for b in self.FORBIDDEN_ROOTS if b in roots]
+        self.assertEqual(offenders, [], f"voidcheck must stay pure: {offenders}")
+
+
+if __name__ == "__main__":
+    unittest.main()
