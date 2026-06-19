@@ -15,6 +15,8 @@ Three primitives, all pure functions over plain values — no DB, no network:
                             or forged nonsense-low loss off the confirm queue.
   * paired_verdict(...)   — the paired 3-seed sign-consistent AGREE rule that
                             promotes/rejects a candidate.
+  * repro_bundle(...)     — assemble a run's reproducibility bundle (config, seed,
+                            git, env, gpu) and judge whether it is re-runnable.
 
 This package must stay dependency-free and I/O-free (enforced by a test), so it
 can be vendored anywhere a result needs checking.
@@ -28,9 +30,11 @@ from voidcheck.core import (  # noqa: F401
     is_implausible_win,
     is_paired,
     paired_verdict,
+    repro_bundle,
 )
 
 __all__ = [
     "SEEDS", "SCREEN_BAND", "CONFIRM_BAND", "MAX_DROP_FACTOR",
     "is_paired", "beats_screen", "is_implausible_win", "paired_verdict",
+    "repro_bundle",
 ]

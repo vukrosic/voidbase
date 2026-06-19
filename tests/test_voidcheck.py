@@ -149,6 +149,65 @@ class PairedVerdictTest(unittest.TestCase):
         self.assertFalse(v["agrees"])  # 0.0005 margin < 0.001 band
 
 
+def _full_run(**over):
+    """A run row with a complete, clean reproducibility bundle; override to break it."""
+    run = {
+        "id": "run-1", "config": {"lr": 3e-3}, "seed": 42,
+        "command": "python run_experiment.py", "content_hash": "abc123",
+        "git_commit": "deadbeef", "git_branch": "main", "git_dirty": False,
+        "env": {"python": "3.11.9", "torch": "2.3.1", "cuda": "12.1"},
+    }
+    run.update(over)
+    return run
+
+
+class ReproBundleTest(unittest.TestCase):
+    """repro_bundle is the integrity check for 'can a third party re-run this
+    champion?' — required fields present AND a clean tree, with env a warning."""
+
+    def test_complete_clean_bundle_is_reproducible(self):
+        b = vc.repro_bundle(_full_run())
+        self.assertTrue(b["reproducible"])
+        self.assertEqual(b["missing"], [])
+        self.assertEqual(b["warnings"], [])
+
+    def test_dirty_tree_blocks_reproducibility_with_warning(self):
+        b = vc.repro_bundle(_full_run(git_dirty=True))
+        self.assertFalse(b["reproducible"])      # commit doesn't capture the diff
+        self.assertEqual(b["missing"], [])       # nothing missing — just dirty
+        self.assertTrue(any("dirty" in w for w in b["warnings"]))
+
+    def test_missing_required_field_is_not_reproducible(self):
+        for field, val in (("config", None), ("seed", None),
+                           ("git_commit", None), ("command", None)):
+            b = vc.repro_bundle(_full_run(**{field: val}))
+            self.assertFalse(b["reproducible"], field)
+            self.assertIn(field, b["missing"])
+
+    def test_seed_zero_counts_as_present(self):
+        # seed 0 is a real seed — presence is "is not None", not truthiness.
+        b = vc.repro_bundle(_full_run(seed=0))
+        self.assertNotIn("seed", b["missing"])
+
+    def test_missing_env_warns_but_does_not_block(self):
+        b = vc.repro_bundle(_full_run(env=None))
+        self.assertTrue(b["reproducible"])       # env is recommended, not required
+        self.assertTrue(any("env" in w for w in b["warnings"]))
+
+    def test_gpu_class_prefers_box_then_falls_back_to_env(self):
+        from_box = vc.repro_bundle(_full_run(env={"gpu": "RTX 3060"}),
+                                   box={"gpu_class": "A100"})
+        self.assertEqual(from_box["gpu_class"], "A100")
+        from_env = vc.repro_bundle(_full_run(env={"gpu": "RTX 3060"}))
+        self.assertEqual(from_env["gpu_class"], "RTX 3060")
+
+    def test_empty_run_degrades_not_raises(self):
+        b = vc.repro_bundle({})
+        self.assertFalse(b["reproducible"])
+        self.assertEqual(sorted(b["missing"]),
+                         ["command", "config", "git_commit", "seed"])
+
+
 class PureLibraryTest(unittest.TestCase):
     """voidcheck must stay pure: no DB / network / filesystem imports, so it can be
     vendored anywhere a result needs checking."""

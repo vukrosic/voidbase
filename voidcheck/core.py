@@ -83,6 +83,82 @@ def is_implausible_win(candidate_val, champion_val,
     return candidate_val < champion_val * max_drop_factor
 
 
+# The fields a third party needs to RE-RUN a result and expect the same number.
+# config + seed fix the experiment, git_commit pins the training code, command is
+# how it was invoked. env (lib/CUDA stack) is recommended, not required — its
+# absence downgrades the verdict to a warning rather than failing it outright,
+# because a run from the exact same commit+config is reproducible-in-principle
+# even when we didn't capture the stack it happened to run on.
+_BUNDLE_REQUIRED = ("config", "seed", "git_commit", "command")
+
+
+def repro_bundle(run: dict, box: dict | None = None) -> dict:
+    """Assemble the reproducibility bundle for a run (pure; no I/O) and judge
+    whether it is actually re-runnable.
+
+    A confirmed champion is only trustworthy if someone else can reproduce it, so
+    "reproducible" is an integrity property, not metadata — it lives here next to
+    is_paired. Given a run row (and optionally its box, for the GPU class) it
+    gathers everything needed to re-run — config, seed, command, content_hash, the
+    git triple, the runtime env — and returns:
+
+      reproducible : True iff every required field (config, seed, git_commit,
+                     command) is present AND the git tree was clean. A dirty tree
+                     means uncommitted changes the commit doesn't capture, so the
+                     commit alone can't reproduce the run.
+      missing      : the required fields that are absent (the blockers).
+      warnings     : non-blocking gaps that weaken reproducibility — a dirty tree,
+                     or an uncaptured runtime stack (numerics may drift).
+
+    Everything is read defensively so a half-populated legacy row degrades to
+    'not reproducible, here's what's missing' instead of raising."""
+    run = run or {}
+    config = run.get("config")
+    git = {
+        "commit": run.get("git_commit"),
+        "branch": run.get("git_branch"),
+        "dirty": run.get("git_dirty"),
+    }
+    env = run.get("env") or {}
+    # GPU class: prefer the box's advertised class, fall back to the gpu the env
+    # probe recorded (a donor's run may carry env.gpu but no joined box row).
+    gpu_class = (box or {}).get("gpu_class") or env.get("gpu")
+
+    present = {
+        "config": bool(config),
+        "seed": run.get("seed") is not None,
+        "git_commit": bool(git["commit"]),
+        "command": bool(run.get("command")),
+    }
+    missing = [f for f in _BUNDLE_REQUIRED if not present[f]]
+
+    warnings = []
+    if git["dirty"]:
+        warnings.append(
+            "git tree was dirty at run time — uncommitted changes are not captured, "
+            "so the commit alone may not reproduce this run")
+    if not env:
+        warnings.append(
+            "no runtime env captured — library/CUDA/GPU stack is unknown, so "
+            "numerics may differ when re-run on another stack")
+
+    reproducible = not missing and not git["dirty"]
+
+    return {
+        "run_id": run.get("id"),
+        "reproducible": reproducible,
+        "missing": missing,
+        "warnings": warnings,
+        "config": config,
+        "seed": run.get("seed"),
+        "command": run.get("command"),
+        "content_hash": run.get("content_hash"),
+        "git": git,
+        "env": env,
+        "gpu_class": gpu_class,
+    }
+
+
 def paired_verdict(jobs: list[dict], confirm_band: float = CONFIRM_BAND,
                    seeds=SEEDS) -> dict:
     """The paired-delta judgement (pure). `jobs` are the collected confirm runs,

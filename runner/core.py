@@ -77,6 +77,54 @@ def _detect_gpu() -> tuple[str | None, str | None]:
         return None, None
 
 
+def repo_git(repo: str | Path) -> dict:
+    """The git triple of the research repo this run trained from: {git_commit,
+    git_branch, git_dirty}. This pins the TRAINING code (the repo holding
+    run_experiment.py), not the runner — that commit is what a champion's
+    reproducibility bundle needs. Best-effort: a non-git dir or missing git yields
+    all-null, never an error (the bundle just reads back 'commit unknown')."""
+    def _git(*args) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(repo), *args],
+                                 capture_output=True, text=True, timeout=10)
+            return out.stdout.strip() or None if out.returncode == 0 else None
+        except Exception:  # noqa: BLE001
+            return None
+    commit = _git("rev-parse", "HEAD")
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    # dirty only when git itself answered (porcelain returns '' for a clean tree);
+    # leave it null when we couldn't read git at all, so 'unknown' != 'clean'.
+    porcelain = _git("status", "--porcelain")
+    status_ok = _git("rev-parse", "--is-inside-work-tree") == "true"
+    dirty = bool(porcelain) if status_ok else None
+    return {"git_commit": commit, "git_branch": branch, "git_dirty": dirty}
+
+
+def probe_env(python: str = "python") -> dict:
+    """The runtime fingerprint the job trained on: {python, platform, torch, cuda,
+    gpu}. Probed with the SAME interpreter that runs the training (`python`), so it
+    reflects the training venv's torch/CUDA, not the runner's. Best-effort: any
+    failure returns {} and the bundle records 'stack unknown'."""
+    probe = (
+        "import json,platform\n"
+        "d={'python':platform.python_version(),'platform':platform.platform()}\n"
+        "try:\n"
+        "    import torch\n"
+        "    d['torch']=torch.__version__\n"
+        "    d['cuda']=getattr(torch.version,'cuda',None)\n"
+        "    if torch.cuda.is_available(): d['gpu']=torch.cuda.get_device_name(0)\n"
+        "except Exception: pass\n"
+        "print(json.dumps(d))\n")
+    try:
+        out = subprocess.run([python, "-c", probe],
+                             capture_output=True, text=True, timeout=30)
+        if out.returncode == 0 and out.stdout.strip():
+            return json.loads(out.stdout.strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
 def local_box(label: str | None = None, gpu_class: str | None = None) -> dict:
     """Describe THIS machine as a voidbase box: {label, gpu_class, fingerprint}.
 
@@ -169,6 +217,11 @@ def report(api: str, token: str | None, result: dict, box_id: str,
         "final_val_loss": result.get("final_val_loss"),
         "final_train_loss": result.get("final_train_loss"),
         "final_val_accuracy": result.get("final_val_accuracy"),
+        # Reproducibility bundle (best-effort; null on older results / non-git repos).
+        "git_commit": result.get("git_commit"),
+        "git_branch": result.get("git_branch"),
+        "git_dirty": result.get("git_dirty"),
+        "env": result.get("env"),
     }
     if eval_points:
         body["eval_points"] = eval_points
@@ -250,6 +303,12 @@ def execute(job: dict, repo: str | Path, python: str = "python",
     except Exception as e:  # noqa: BLE001
         out, ok, rc = f"runner error: {e}", False, -1
 
+    # Capture the reproducibility bundle alongside the metrics: the research repo's
+    # git triple and the training venv's runtime stack, so report() can pin exactly
+    # what produced this number. Skipped on a dry run (it reports nothing).
+    git = {} if dry else repo_git(repo)
+    env = {} if dry else probe_env(python)
+
     return {
         "queue_item_id": job.get("id"),
         "ok": ok,
@@ -262,6 +321,10 @@ def execute(job: dict, repo: str | Path, python: str = "python",
         "final_val_loss": _last(_VAL_RE, out) or _last(_VAL_FALLBACK_RE, out),
         "final_train_loss": _last(_TRAIN_RE, out),
         "final_val_accuracy": _last(_ACC_RE, out),
+        "git_commit": git.get("git_commit"),
+        "git_branch": git.get("git_branch"),
+        "git_dirty": git.get("git_dirty"),
+        "env": env or None,
         "stdout": out,
     }
 
