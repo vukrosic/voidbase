@@ -7,6 +7,61 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · 🔬 FINDING: the confirmed mechanisms do NOT compound (interference)
+
+**A real research conclusion, not a build.** Both two-mechanism stacks of the
+search's strong/confirmed singles came back NEGATIVE:
+- `swiglu_ffn+canon_conv` = 6.1684, **+0.0036 (sub-band)** — far WORSE than either
+  alone (swiglu −0.0118, canon_conv −0.0101 confirmed). The two best confirmed
+  mechanisms INTERFERE when combined.
+- `swiglu_ffn+cross_block_score_share` = 6.1609, +0.0111 — ≈ swiglu alone (no gain
+  from adding the second mechanism).
+
+**Implication:** unlike the champion LINEAGE (deepnet_alpha → poly_alibi → momentum
+→ … which compounded super-additively), the NEW winners from the untried-space
+search do NOT stack with each other — they're individually good but redundant or
+conflicting. So `--mode stack` (combine proven winners) is the WRONG strategy for
+this generation; the search should instead **promote the best single (swiglu_ffn,
+−0.0118) as champion and search fresh from THAT baseline** for mechanisms that
+compound with it. Promotion is the human's call (guardrail) — flagged for them.
+
+This is exactly the kind of conclusion the paired gate + findings exist to produce:
+a confident "these don't combine," earned from real paired/faithful runs, not a hunch.
+
+**Self-critique**
+- *I over-invested in stack mode* (built `--mode stack`, `--seed-from confirmed`,
+  hand-prioritized the pairs) on the ASSUMPTION that confirmed winners compound —
+  the lineage's history made that plausible. Two clean negatives just falsified it
+  for this generation. I should have run ONE stack as a probe before building the
+  whole stacking apparatus. Build the cheap experiment before the machinery.
+- *The remaining queued stacks (swiglu+gmlp_sgu, swiglu+av_output_carry) are now
+  low-value* — gmlp_sgu was rejected, and the compound pattern is negative. I'm
+  leaving them (2 data points isn't proof, and they're cheap), but the higher-value
+  GPU spend is single-flag exploration of the ~95 untried mechanisms. Could cancel
+  them to reprioritize; didn't, to avoid over-reacting to n=2.
+- *Still no champion promotion* so every stack ran on the stale 6.172 baseline — if
+  swiglu were champion, "compounds with swiglu" would be tested from swiglu's level,
+  not the old champion's. The manual gate is genuinely costing search efficiency now.
+
+**Also fixed (RULE-0 leak, `938ce54`):** auditing the queue for the strategy shift, I
+found `use_moonlight_muon` — an OPTIMIZER — queued in the STRUCTURAL search. Audit
+showed **7 optimizer flags had leaked** (galore/looksam/mars/moonlight_muon/soap/swan/
+tiger): their names didn't contain an existing `OPTIMIZER_DENY` token (`muon_`'s
+trailing underscore doesn't match `moonlight_muon`). use_galore had already RUN (and
+tanked at 6.97) — so the search has been burning some GPU on optimizer experiments it
+was designed to exclude. Added the 7 fragments to the deny list (153→146 candidates),
+cancelled the queued leak, +2 tests (the 7 denied, 10 structural NOT over-denied).
+
+**Next moves (priority order)**
+1. **Recommend promotion** (in the log / dashboard): swiglu_ffn (−0.0118) is the best
+   confirmed; promoting it unblocks compounding-from-the-real-frontier. Human's call.
+2. **Reprioritize toward single-flag exploration** of untried mechanisms over more
+   stacks of the current (non-compounding) winners — the queue already has 14 untried
+   singles vs 2 stacks, so it's mostly there.
+3. Restart worker at idle to activate the attempts cap.
+
+---
+
 ## 2026-06-19 · Bound infra retries (attempts cap) — the last robustness gap closed
 
 **Closed the one robustness gap I'd logged for ~5 fires.** The SSH-drop re-queue
