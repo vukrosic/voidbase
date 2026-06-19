@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import voidconfig  # noqa: E402  — pure config-row shape + authoritative dedup hash (Voidmind writes)
 
-from backend import LEASE_SECONDS, _pg_exec, _pg_rows  # noqa: E402
+from backend import LEASE_SECONDS, _pg_exec, _pg_executemany, _pg_rows  # noqa: E402
 
 
 # --- box heartbeat + dashboard thread writes (operator, localhost) -----------
@@ -361,21 +361,29 @@ def report_run(body: dict, contributor_id: str) -> dict:
          body.get("git_commit"), body.get("git_branch"), body.get("git_dirty"),
          json.dumps(env) if env is not None else None))
 
-    # Optional per-step learning curve (eval_points). Best-effort: a malformed
-    # point list must not lose the run row we just wrote.
-    points = body.get("eval_points") or []
-    for p in points:
-        try:
-            _pg_exec(
-                """insert into eval_points (run_id, step, tokens, val_loss,
-                                            val_accuracy, val_perplexity,
-                                            learning_rate, elapsed_seconds)
-                   values (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                (run_id, p.get("step"), p.get("tokens"), p.get("val_loss"),
-                 p.get("val_accuracy"), p.get("val_perplexity"),
-                 p.get("learning_rate"), p.get("elapsed_seconds")))
-        except Exception:  # noqa: BLE001
-            pass
+    # Optional per-step learning curve (eval_points). Batched into ONE round-trip
+    # — a run can report hundreds of steps, and a point-per-INSERT loop was that
+    # many Neon round-trips. Best-effort: a malformed point list must not lose the
+    # run row we just wrote, so a failed batch falls back to per-row inserts that
+    # skip only the bad points.
+    ep_sql = ("""insert into eval_points (run_id, step, tokens, val_loss,
+                                          val_accuracy, val_perplexity,
+                                          learning_rate, elapsed_seconds)
+                 values (%s, %s, %s, %s, %s, %s, %s, %s)""")
+    points = [p for p in (body.get("eval_points") or []) if isinstance(p, dict)]
+    ep_params = [
+        (run_id, p.get("step"), p.get("tokens"), p.get("val_loss"),
+         p.get("val_accuracy"), p.get("val_perplexity"),
+         p.get("learning_rate"), p.get("elapsed_seconds"))
+        for p in points]
+    try:
+        _pg_executemany(ep_sql, ep_params)
+    except Exception:  # noqa: BLE001 — one bad point shouldn't drop the whole curve
+        for params in ep_params:
+            try:
+                _pg_exec(ep_sql, params)
+            except Exception:  # noqa: BLE001
+                pass
 
     _pg_exec("update queue_items set status = %s, finished_at = now() where id = %s",
              (status, qid))

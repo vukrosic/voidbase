@@ -6,7 +6,8 @@ writes.py, server.py) calls `rows()` / `_pg_rows()` / `_pg_exec()` and never
 touches a driver. Two backends behind one contract:
 
   * Postgres (Neon) when DATABASE_URL is configured — the real distributed store,
-    a single long-lived connection reused across requests under a lock.
+    served from a bounded connection pool so concurrent multi-writer requests run
+    in parallel (one connection each) instead of serializing on one.
   * SQLite (registry/experiments.sqlite) otherwise — the legacy local store, a
     fresh read-only connection per query, zero installs.
 
@@ -16,6 +17,7 @@ callers build are identical across both, so the front end never changes on cutov
 from __future__ import annotations
 
 import os
+import queue
 import sqlite3
 import sys
 import threading
@@ -51,68 +53,136 @@ REQUIRE_AUTH = os.environ.get("VOIDBASE_REQUIRE_AUTH", "").lower() in ("1", "tru
 
 # --- backend-agnostic query helpers -----------------------------------------
 #
-# Postgres: ONE long-lived connection reused across requests, guarded by a lock.
-# Opening a fresh TLS connection to Neon per query is ~0.5s each — a single
-# /health (7 counts) would stall for seconds. A persistent connection makes warm
-# requests sub-millisecond. Serializing with a lock is fine for a localhost,
-# single-operator dashboard; swap in psycopg_pool if this ever serves many.
+# Postgres: a BOUNDED POOL of connections, one borrowed per query.
+#
+# This replaced a single long-lived connection behind a global lock. That was
+# fine for a single-operator dashboard, but the platform is multi-writer by
+# design (concurrent Voidrunner /claim+/runs and Voidmind /ideas from many donor
+# boxes, served by a ThreadingHTTPServer). A global lock serialized every one of
+# those onto one connection — the API became the bottleneck the multi-writer
+# Postgres backend exists to avoid.
+#
+# The pool is a fixed set of slots in a thread-safe queue; each request borrows a
+# slot, runs its query on its OWN connection (so requests run concurrently), and
+# returns it. The bound matters two ways: it lets N requests proceed in parallel
+# up to N, AND it caps how many Neon/PgBouncer connections an unbounded thread
+# swarm can open — get(timeout) applies backpressure instead of exhausting Neon.
+# Connections open lazily (a slot starts empty) and re-open on drop, so a cold
+# start costs nothing and a dropped connection self-heals, as before. Dependency-
+# free on purpose: psycopg_pool isn't installed and there's no requirements file,
+# so this uses only stdlib queue + the already-present psycopg.
 
-_pg_conn = None
-_pg_lock = threading.Lock()
+_POOL_SIZE = int(os.environ.get("VOIDBASE_PG_POOL_SIZE", "8"))
+# How long a request waits for a free slot before failing — backpressure, not a
+# hang. Bounds tail latency when every connection is busy.
+_POOL_TIMEOUT = float(os.environ.get("VOIDBASE_PG_POOL_TIMEOUT", "15"))
+
+_pool: "queue.Queue | None" = None
+_pool_init_lock = threading.Lock()
 
 
-def _pg_connection():
-    """Return the cached connection, opening it if absent. No round-trip ping —
-    a dropped connection is detected lazily when a query fails (see _pg_rows),
-    which reconnects and retries. Pinging here would double every endpoint's
-    round-trips to a distant Neon region (the dominant cost)."""
-    global _pg_conn
+def _get_pool() -> "queue.Queue":
+    """The connection pool, created on first use. Each slot starts as None (an
+    unopened connection) and is filled lazily on first borrow, so importing this
+    module — or running the SQLite backend — never opens a socket."""
+    global _pool
+    if _pool is None:
+        with _pool_init_lock:
+            if _pool is None:
+                q: queue.Queue = queue.Queue(maxsize=_POOL_SIZE)
+                for _ in range(_POOL_SIZE):
+                    q.put(None)  # empty slot — opened on first borrow
+                _pool = q
+    return _pool
+
+
+def _borrow():
+    """Borrow a slot from the pool, raising a clear backpressure error if every
+    connection is busy past the timeout. Returns whatever the slot holds (a live
+    connection or None to be opened by the caller)."""
+    try:
+        return _get_pool().get(timeout=_POOL_TIMEOUT)
+    except queue.Empty:
+        raise RuntimeError(
+            f"db pool exhausted: all {_POOL_SIZE} connections busy for "
+            f"{_POOL_TIMEOUT}s (raise VOIDBASE_PG_POOL_SIZE if this is sustained)")
+
+
+def _run_pg(sql: str, params: tuple, *, fetch: bool) -> list[dict]:
+    """Borrow a slot, run one autocommit query on its connection, return the slot.
+    Opens the connection if the slot is empty/closed and reconnects once on a
+    dropped connection — the same self-healing the single-connection path had,
+    now per-slot. `fetch` distinguishes a read (always fetchall) from a write
+    (fetchall only when the statement RETURNs)."""
     import psycopg
+    from psycopg.rows import dict_row
 
-    if _pg_conn is None or _pg_conn.closed:
-        _pg_conn = psycopg.connect(PG_URL, autocommit=True)
-    return _pg_conn
+    conn = _borrow()
+    try:
+        for attempt in (1, 2):  # one reconnect-and-retry on a dropped connection
+            try:
+                if conn is None or conn.closed:
+                    conn = psycopg.connect(PG_URL, autocommit=True)
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(sql, params)
+                    if fetch:
+                        return list(cur.fetchall())
+                    return list(cur.fetchall()) if cur.description else []
+            except psycopg.OperationalError:
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                conn = None  # next attempt opens a fresh connection
+                if attempt == 2:
+                    raise
+        return []
+    finally:
+        _get_pool().put(conn)  # return the slot (a live conn, or None to reopen)
 
 
 def _pg_rows(sql: str, params: tuple = ()) -> list[dict]:
-    import psycopg
-    from psycopg.rows import dict_row
-
-    with _pg_lock:
-        for attempt in (1, 2):  # one reconnect-and-retry on a dropped connection
-            try:
-                conn = _pg_connection()
-                with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(sql, params)
-                    return list(cur.fetchall())
-            except psycopg.OperationalError:
-                global _pg_conn
-                _pg_conn = None
-                if attempt == 2:
-                    raise
-        return []
+    return _run_pg(sql, params, fetch=True)
 
 
 def _pg_exec(sql: str, params: tuple = ()) -> list[dict]:
-    """Write helper (INSERT/UPDATE … RETURNING). Same reconnect-and-retry as
-    _pg_rows; autocommit is on so each call is its own transaction. Postgres
-    only — the SQLite backend is read-only for the dashboard."""
+    """Write helper (INSERT/UPDATE … RETURNING). autocommit is on so each call is
+    its own transaction. Postgres only — the SQLite backend is read-only."""
+    return _run_pg(sql, params, fetch=False)
+
+
+def _pg_executemany(sql: str, seq_of_params) -> None:
+    """Batch many rows in ONE round-trip on a single borrowed connection, instead
+    of N separate _pg_exec calls (each a full Neon round-trip). Used for per-step
+    eval_points, where a run can report hundreds of points. No RETURNING; a no-op
+    on an empty sequence."""
     import psycopg
     from psycopg.rows import dict_row
 
-    with _pg_lock:
+    params_list = list(seq_of_params)
+    if not params_list:
+        return
+    conn = _borrow()
+    try:
         for attempt in (1, 2):
             try:
-                conn = _pg_connection()
+                if conn is None or conn.closed:
+                    conn = psycopg.connect(PG_URL, autocommit=True)
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(sql, params)
-                    return list(cur.fetchall()) if cur.description else []
+                    cur.executemany(sql, params_list)
+                return
             except psycopg.OperationalError:
-                global _pg_conn
-                _pg_conn = None
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                conn = None
                 if attempt == 2:
                     raise
-        return []
+    finally:
+        _get_pool().put(conn)
 
 
 def _sqlite_rows(sql: str, params: tuple = ()) -> list[dict]:
