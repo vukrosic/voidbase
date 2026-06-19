@@ -54,9 +54,15 @@ OPTIMIZER_DENY = (
     "adabelief", "adamp", "adan", "adapnm", "adashift", "adafactor", "adagrad",
     "adamw", "came", "dadapt", "prodigy", "lamb", "lars", "lion", "sophia",
     "novograd", "shampoo", "ranger", "radam", "nadam", "sgd", "rmsprop",
-    "cautious", "lookahead", "_sam", "gsam", "schedule_free", "muon_",
+    "cautious", "lookahead", "_sam", "gsam", "looksam", "schedule_free", "muon_",
     "_lr", "weight_decay", "_wd", "momentum", "warmup", "batch_size",
     "grad_accum", "schedule", "ema_opt",
+    # named optimizers that leaked into the structural search (RULE-0 violation):
+    # use_galore/looksam/mars/moonlight_muon/soap/swan/tiger are all OPTIMIZERS, not
+    # architecture. Their names didn't contain an existing token (e.g. "muon_" has a
+    # trailing underscore that "moonlight_muon" lacks). Each fragment is distinctive
+    # enough not to over-match a structural flag.
+    "galore", "mars", "moonlight", "muon", "soap", "swan", "tiger",
 )
 
 

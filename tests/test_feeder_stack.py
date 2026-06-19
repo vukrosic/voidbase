@@ -14,7 +14,35 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.feeder import winning_singles  # noqa: E402
+from scripts.feeder import winning_singles, OPTIMIZER_DENY  # noqa: E402
+
+
+class OptimizerDenyTest(unittest.TestCase):
+    """RULE 0: the structural search must exclude optimizer flags. These 7 leaked
+    once because their names didn't contain an existing deny token (e.g. 'muon_'
+    has a trailing underscore that 'moonlight_muon' lacks)."""
+
+    LEAKED_OPTIMIZERS = (
+        "use_galore", "use_looksam", "use_mars", "use_moonlight_muon",
+        "use_soap", "use_swan", "use_tiger",
+    )
+    # structural flags that must NOT be caught by the (broadened) deny list
+    STRUCTURAL_OK = (
+        "use_swiglu_ffn", "use_canon_conv", "use_cross_block_score_share",
+        "use_qk_layernorm", "use_value_residual", "use_parallel_block",
+        "use_attn_logit_bias", "use_sub_ln", "use_nope", "use_mla",
+    )
+
+    def _denied(self, name):
+        return any(tok in name for tok in OPTIMIZER_DENY)
+
+    def test_leaked_optimizers_now_denied(self):
+        for f in self.LEAKED_OPTIMIZERS:
+            self.assertTrue(self._denied(f), f"{f} should be denied (it's an optimizer)")
+
+    def test_structural_flags_not_over_denied(self):
+        for f in self.STRUCTURAL_OK:
+            self.assertFalse(self._denied(f), f"{f} is structural — must NOT be denied")
 
 
 class _FakeCursor:
