@@ -201,7 +201,7 @@ class ExperimentRegistry:
                 id, thread_name, name, command, status, priority,
                 gpu_class, created_at, started_at,
                 finished_at, log_path, output_dir, decision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
             ON CONFLICT(thread_name, name) DO UPDATE SET
                 command=excluded.command,
                 status=excluded.status,

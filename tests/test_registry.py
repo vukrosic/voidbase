@@ -68,32 +68,24 @@ class ExperimentRegistryTest(unittest.TestCase):
                 )
                 idea_id = registry.add_idea(
                     "Example lever",
-                    command="python train_llm.py --config 10m",
-                    thread_name="layerscale",
+                    explanation="python train_llm.py --config 10m",
                     status="proposed",
-                    proposed_by="test",
-                )
-                queue_id_2 = registry.approve_and_promote_idea(
-                    idea_id,
-                    reviewed_by="test",
-                    review_note="looks good",
-                    created_by="test",
                 )
 
                 summary = registry.summary()
                 self.assertEqual(summary["threads"], 1)
-                self.assertEqual(summary["queue_items"], 2)
+                self.assertEqual(summary["queue_items"], 1)
                 self.assertEqual(summary["runs"], 1)
                 self.assertEqual(summary["eval_points"], 2)
                 self.assertEqual(summary["comparisons"], 1)
                 self.assertEqual(summary["decisions"], 1)
                 self.assertEqual(summary["ideas"], 1)
                 self.assertEqual(summary["runs_by_status"]["completed"], 1)
-                self.assertEqual(summary["queue_by_status"]["planned"], 2)
+                self.assertEqual(summary["queue_by_status"]["planned"], 1)
 
                 idea = registry.get_idea(idea_id)
-                self.assertEqual(idea["status"], "queued")
-                self.assertEqual(idea["queue_item_id"], queue_id_2)
+                self.assertEqual(idea["status"], "proposed")
+                self.assertEqual(idea["explanation"], "python train_llm.py --config 10m")
 
                 row = registry.conn.execute(
                     "SELECT final_val_loss, final_val_accuracy, final_train_loss, git_commit, git_branch, git_dirty "
@@ -129,15 +121,13 @@ class ExperimentRegistryTest(unittest.TestCase):
                 self.assertEqual(imported, 2)
 
                 rows = registry.conn.execute(
-                    "SELECT title, status, priority, outcome, reference_url, thread_name "
-                    "FROM ideas ORDER BY priority, title"
+                    "SELECT title, status, explanation "
+                    "FROM ideas ORDER BY title"
                 ).fetchall()
                 self.assertEqual(rows[0]["title"], "Value residual / value embeddings")
                 self.assertEqual(rows[0]["status"], "open")
-                self.assertEqual(rows[0]["priority"], 0)
-                self.assertEqual(rows[0]["outcome"], "🔲 open")
-                self.assertEqual(rows[0]["thread_name"], "recipe")
-                self.assertTrue(str(rows[0]["reference_url"]).endswith("KNOWN_LEVERS.md"))
+                self.assertIn("modded-nanoGPT trick", rows[0]["explanation"])
+                self.assertEqual(rows[1]["title"], "Zero-init output projections")
                 self.assertEqual(rows[1]["status"], "have")
 
 
