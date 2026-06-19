@@ -250,27 +250,37 @@ def parse_val_accuracy(text: str):
 
 
 def report(conn, job: dict, box_id: str, ok: bool, val_loss, command: str, tail: str,
-           train_loss=None, val_accuracy=None) -> None:
+           train_loss=None, val_accuracy=None, repro: dict | None = None) -> None:
     """Write a run row (born unverified — the champion only moves through the
     confirm gate) and close out the queue item. Carries the config + content_hash
     so the result is dedupable and reproducible. One transaction.
+
+    `repro` (from probe_box_repro) pins the box's git triple + runtime env, so an
+    operator-promoted champion gets the same reproducibility bundle as a donor's —
+    best-effort and nullable, so a failed probe never blocks the report.
 
     A DRY run NEVER lands here — it only validates the resolved config on the box
     and must not pollute `runs` (a null-val dry row would dedup-block the real
     run). See run_one: dry returns before reporting, mirroring claim-test."""
     run_id = f"{job['id']}--{uuid.uuid4().hex[:8]}"
     config = job.get("config")
+    repro = repro or {}
+    env = repro.get("env")
     cur = conn.cursor()
     cur.execute(
         """insert into runs (id, queue_item_id, thread_name, name, box_id,
                              command, config, content_hash, status,
                              final_val_loss, final_train_loss, final_val_accuracy,
+                             git_commit, git_branch, git_dirty, env,
                              finished_at)
-           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())""",
+           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                   %s, %s, %s, %s, now())""",
         (run_id, job["id"], job["thread"], job["name"], box_id,
          command, json.dumps(config) if config is not None else None,
          job.get("content_hash"), "done" if ok else "failed",
-         val_loss, train_loss, val_accuracy),
+         val_loss, train_loss, val_accuracy,
+         repro.get("git_commit"), repro.get("git_branch"), repro.get("git_dirty"),
+         json.dumps(env) if env is not None else None),
     )
     cur.execute(
         "update queue_items set status=%s, finished_at=now() where id=%s",
@@ -329,6 +339,57 @@ def run_on_box(remote_cmd: str):
     ]
     proc = subprocess.run(ssh, capture_output=True, text=True, timeout=JOB_TIMEOUT)
     return proc.returncode, (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+
+# A tiny script that prints the box's reproducibility fingerprint as one
+# `VOIDBASE_REPRO={json}` line: the BOX_REPO git triple + the training venv's
+# python/torch/CUDA/gpu. Run with BOX_PYTHON after a `cd BOX_REPO`, so git sees the
+# repo and torch reflects the same interpreter the job trained with.
+_REPRO_PROBE_PY = (
+    "import json,platform,subprocess\n"
+    "def g(*a):\n"
+    "    try:\n"
+    "        o=subprocess.run(['git',*a],capture_output=True,text=True,timeout=10)\n"
+    "        return (o.stdout.strip() or None) if o.returncode==0 else None\n"
+    "    except Exception: return None\n"
+    "env={'python':platform.python_version(),'platform':platform.platform()}\n"
+    "try:\n"
+    "    import torch\n"
+    "    env['torch']=torch.__version__\n"
+    "    env['cuda']=getattr(torch.version,'cuda',None)\n"
+    "    if torch.cuda.is_available(): env['gpu']=torch.cuda.get_device_name(0)\n"
+    "except Exception: pass\n"
+    "inside=g('rev-parse','--is-inside-work-tree')=='true'\n"
+    "print('VOIDBASE_REPRO='+json.dumps({'git_commit':g('rev-parse','HEAD'),"
+    "'git_branch':g('rev-parse','--abbrev-ref','HEAD'),"
+    "'git_dirty':(bool(g('status','--porcelain')) if inside else None),'env':env}))\n")
+
+
+def parse_repro(out: str) -> dict:
+    """Pull the {git_commit, git_branch, git_dirty, env} dict out of a probe's
+    output (the line after the VOIDBASE_REPRO= marker). Pure; {} if absent or
+    malformed, so a probe miss never breaks the report."""
+    for line in (out or "").splitlines():
+        if line.startswith("VOIDBASE_REPRO="):
+            try:
+                return json.loads(line[len("VOIDBASE_REPRO="):])
+            except Exception:  # noqa: BLE001
+                return {}
+    return {}
+
+
+def probe_box_repro() -> dict:
+    """SSH a short probe to the box and return its reproducibility fingerprint.
+    Best-effort: one fast extra SSH against a multi-minute training run, and any
+    failure (probe error, no torch, non-git repo) returns {} — the run is still
+    reported, just with a less complete bundle."""
+    cmd = (f"cd {shlex.quote(BOX_REPO)} && "
+           f"{shlex.quote(BOX_PYTHON)} -c {shlex.quote(_REPRO_PROBE_PY)}")
+    try:
+        rc, out = run_on_box(cmd)
+        return parse_repro(out) if rc == 0 else {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 # Markers that a run FAILED because the SSH/box connection dropped — an infra
@@ -435,9 +496,14 @@ def run_one(repo: Path, box_id: str) -> bool:
             log(f"{job['id']} infra failure (rc={rc}) hit the "
                 f"{MAX_INFRA_ATTEMPTS}-attempt cap — recording FAILED (box likely down)")
             # fall through to report() with ok=False → a real `failed` row
+        # Probe the box's reproducibility fingerprint (git + runtime stack) so the
+        # reported run carries a re-runnable bundle. Best-effort, off the DB
+        # connection — a probe miss just yields a less complete bundle.
+        repro = probe_box_repro()
         report(conn, job, box_id, ok,
                parse_val_loss(out), remote_cmd, out[-2000:],
-               train_loss=parse_train_loss(out), val_accuracy=parse_val_accuracy(out))
+               train_loss=parse_train_loss(out), val_accuracy=parse_val_accuracy(out),
+               repro=repro)
     finally:
         conn.close()
     return True

@@ -361,6 +361,46 @@ def lineage(run_id: str) -> dict:
     return voidcredit.run_lineage(run, queue_item=qi, thread=thread, champions=champs)
 
 
+def champion_bundle(scope: str) -> dict:
+    """The reproducibility bundle for a scope's CURRENT champion: everything a
+    third party needs to re-run it, plus voidcheck's judgement of whether it
+    actually can be. This is "trust without reputation" made checkable — a
+    confirmed champion that isn't reproducible is a result nobody else can stand
+    behind, and this endpoint surfaces exactly that.
+
+    Joins the live champion (superseded_at is null) to its run and box, then hands
+    the rows to voidcheck.repro_bundle (the single source for the bundle shape +
+    the reproducible verdict). Postgres-only; the legacy SQLite store has no
+    champions table, so it returns {}."""
+    scope = scope or "tiny1m3m"
+    if not PG_URL:
+        return {}
+    champs = _pg_rows(
+        """select c.run_id, c.val_loss, c.promoted_at,
+                  r.config, r.seed, r.command, r.content_hash,
+                  r.git_commit, r.git_branch, r.git_dirty, r.env,
+                  b.gpu_class, b.label as box_label
+           from champions c
+           join runs r on r.id = c.run_id
+           left join boxes b on b.id = r.box_id
+           where c.scope = %s and c.superseded_at is null""",
+        (scope,))
+    if not champs:
+        return {"scope": scope, "champion": None, "bundle": None}
+    row = champs[0]
+    run = {"id": row["run_id"], "config": row.get("config"), "seed": row.get("seed"),
+           "command": row.get("command"), "content_hash": row.get("content_hash"),
+           "git_commit": row.get("git_commit"), "git_branch": row.get("git_branch"),
+           "git_dirty": row.get("git_dirty"), "env": row.get("env")}
+    box = {"gpu_class": row.get("gpu_class"), "label": row.get("box_label")}
+    return {
+        "scope": scope,
+        "champion": {"run_id": row["run_id"], "val_loss": row.get("val_loss"),
+                     "promoted_at": row.get("promoted_at")},
+        "bundle": voidcheck.repro_bundle(run, box=box),
+    }
+
+
 def _confirm_progress(run_id: str) -> dict | None:
     """How far along the paired 3-seed confirm for one candidate is: terminal vs
     total jobs (target 6 = 3 seeds x 2 arms), or None if no confirm is in flight.

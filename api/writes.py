@@ -338,18 +338,28 @@ def report_run(body: dict, contributor_id: str) -> dict:
         seed = config.get("seed")
     run_id = f"{qid}--{uuid.uuid4().hex[:8]}"
 
+    # Reproducibility bundle (git triple + runtime env): the client captures the
+    # commit/branch/dirty of the research repo it ran and its python/torch/CUDA
+    # stack, so a confirmed champion carries everything needed to re-run it. All
+    # best-effort and nullable — an older client that doesn't send them just yields
+    # a bundle voidcheck marks 'not reproducible' rather than a failed report.
+    env = body.get("env")
     _pg_exec(
         """insert into runs (id, queue_item_id, thread_name, name, contributor_id,
                              box_id, command, config, content_hash, seed, status,
                              final_val_loss, final_train_loss, final_val_accuracy,
+                             git_commit, git_branch, git_dirty, env,
                              finished_at)
-           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())""",
+           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                   %s, %s, %s, %s, now())""",
         (run_id, qid, thread_name, name, contributor_id, box_id,
          body.get("command"),
          json.dumps(config) if config is not None else None,
          body.get("content_hash"), seed, status,
          body.get("final_val_loss"), body.get("final_train_loss"),
-         body.get("final_val_accuracy")))
+         body.get("final_val_accuracy"),
+         body.get("git_commit"), body.get("git_branch"), body.get("git_dirty"),
+         json.dumps(env) if env is not None else None))
 
     # Optional per-step learning curve (eval_points). Best-effort: a malformed
     # point list must not lose the run row we just wrote.

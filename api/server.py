@@ -29,6 +29,7 @@ Endpoints (GET unless noted, JSON):
   /contributor?handle=  one contributor's card (voidcredit; PG-only)
   /lineage?run=  thread→queue_item→run→champion chain (voidcredit; PG-only)
   /gate?scope=   confirm-gate status (champion + candidate field + the blocker)
+  /bundle?scope= the current champion's reproducibility bundle + re-runnable verdict
   /dashboard?scope=  composite (health+champions+gate+runs+comparisons+activity)
 
   POST /threads        author / update a research thread (dashboard)
@@ -51,9 +52,9 @@ from urllib.parse import parse_qs, urlparse
 
 from backend import BACKEND, DB_PATH, PG_URL, REQUIRE_AUTH, rows
 from reads import (
-    activity, comparisons, contributor, dashboard, eval_points, findings, gate,
-    health, leaderboard, lineage, runs, thread_goal, threads, threads_public,
-    warm_dashboard,
+    activity, champion_bundle, comparisons, contributor, dashboard, eval_points,
+    findings, gate, health, leaderboard, lineage, runs, thread_goal, threads,
+    threads_public, warm_dashboard,
 )
 from writes import (
     automation_contributor_id, box_heartbeat, claim_job, claim_thread,
@@ -200,6 +201,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/gate":
                 self._send(200, gate(q.get("scope", [""])[0]))
                 return
+            if path == "/bundle":
+                self._send(200, champion_bundle(q.get("scope", [""])[0]))
+                return
             if path == "/dashboard":
                 self._send(200, dashboard(q.get("scope", [""])[0]))
                 return
@@ -211,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
                 routes = sorted([*ROUTES, "/eval?run_id=",
                                  "/threads/public?status=&unclaimed=", "/threads/goal?name=",
                                  "/contributor?handle=", "/lineage?run=", "/gate?scope=",
-                                 "/dashboard?scope=", "/findings?scope="])
+                                 "/bundle?scope=", "/dashboard?scope=", "/findings?scope="])
                 self._send(404, {"error": "not found", "routes": routes})
                 return
             self._send(200, handler())

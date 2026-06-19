@@ -131,6 +131,10 @@ create table if not exists runs (
     git_commit          text,
     git_branch          text,
     git_dirty           boolean,
+    -- Runtime fingerprint (0011): {python, platform, torch, cuda, gpu}, best-effort,
+    -- captured by the client at report time. Null = stack unknown. The other half of
+    -- the reproducibility bundle alongside config/seed/git — see voidcheck.repro_bundle.
+    env                 jsonb,
     created_at          timestamptz not null default now(),
     finished_at         timestamptz
 );
