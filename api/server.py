@@ -51,8 +51,8 @@ from urllib.parse import parse_qs, urlparse
 
 from backend import BACKEND, DB_PATH, PG_URL, REQUIRE_AUTH, rows
 from reads import (
-    activity, comparisons, contributor, dashboard, eval_points, gate, health,
-    leaderboard, lineage, runs, thread_goal, threads, threads_public,
+    activity, comparisons, contributor, dashboard, eval_points, findings, gate,
+    health, leaderboard, lineage, runs, thread_goal, threads, threads_public,
     warm_dashboard,
 )
 from writes import (
@@ -203,12 +203,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/dashboard":
                 self._send(200, dashboard(q.get("scope", [""])[0]))
                 return
+            if path == "/findings":
+                self._send(200, findings(q.get("scope", [""])[0]))
+                return
             handler = ROUTES.get(path)
             if handler is None:
                 routes = sorted([*ROUTES, "/eval?run_id=",
                                  "/threads/public?status=&unclaimed=", "/threads/goal?name=",
                                  "/contributor?handle=", "/lineage?run=", "/gate?scope=",
-                                 "/dashboard?scope="])
+                                 "/dashboard?scope=", "/findings?scope="])
                 self._send(404, {"error": "not found", "routes": routes})
                 return
             self._send(200, handler())

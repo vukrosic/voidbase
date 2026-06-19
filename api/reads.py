@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import voidcredit  # noqa: E402  — pure attribution/leaderboard policy (Postgres-only edges)
 import voidcheck   # noqa: E402  — pure trust rules (the screen band + plausibility floor; single source)
+from scripts.findings import bucket_for  # noqa: E402 — the pure evidence classifier (one source)
 
 from backend import BACKEND, DB_PATH, PG_URL, RUN_STATUS, _pg_rows, rows  # noqa: E402
 
@@ -468,6 +469,55 @@ def gate(scope: str) -> dict:
             "clears": clears, "near_miss": near_miss, "blocker": blocker,
             "recent_verdicts": recent_verdicts,
             "confirmed_pending": pending}
+
+
+def findings(scope: str) -> dict:
+    """The research OUTPUT: every tested structural mechanism binned by EVIDENCE
+    strength (the same `bucket_for` the findings CLI uses, one source). Paired-
+    confirmed = real; single-seed = suggestive only. Postgres-only (needs the
+    confirmations join); SQLite returns empty buckets."""
+    scope = scope or "tiny1m3m"
+    empty = {"scope": scope, "champion_val": None,
+             "screen_band": voidcheck.SCREEN_BAND, "counts": {}, "buckets": {}}
+    if not PG_URL:
+        return empty
+    champ = _pg_rows("select val_loss from champions where scope=%s "
+                     "and superseded_at is null order by promoted_at desc limit 1",
+                     (scope,))
+    champ_val = float(champ[0]["val_loss"]) if champ else None
+    band = voidcheck.SCREEN_BAND
+    # paired verdicts: mechanism name -> (agrees, delta)
+    verdict: dict[str, tuple] = {}
+    for r in _pg_rows("select r.name, c.agrees, c.delta_from_original from "
+                      "confirmations c join runs r on r.id=c.run_id "
+                      "where r.thread_name=%s", (scope,)):
+        if r["name"] not in verdict or r["agrees"]:
+            verdict[r["name"]] = (bool(r["agrees"]),
+                                  float(r["delta_from_original"])
+                                  if r["delta_from_original"] is not None else None)
+    # best (lowest) val per mechanism, excluding confirm-machinery rows
+    best: dict[str, float | None] = {}
+    for r in _pg_rows("select name, min(final_val_loss) as v from runs "
+                      "where thread_name=%s and name like 'use_%%' "
+                      "and name not like 'confirm-%%' group by name", (scope,)):
+        best[r["name"]] = float(r["v"]) if r["v"] is not None else None
+    names = set(best) | set(verdict)
+    buckets: dict[str, list] = {k: [] for k in
+                                ("confirmed", "rejected", "lead", "marginal",
+                                 "neutral", "implausible", "failed")}
+    for name in names:
+        v = best.get(name)
+        b = bucket_for(v, verdict.get(name), champ_val, band)
+        entry = {"name": name, "val": v}
+        if name in verdict:
+            entry["paired_delta"] = verdict[name][1]
+        elif v is not None and champ_val is not None:
+            entry["margin"] = round(champ_val - v, 4)
+        buckets[b].append(entry)
+    for k in buckets:
+        buckets[k].sort(key=lambda e: e["val"] if e.get("val") is not None else 9e9)
+    return {"scope": scope, "champion_val": champ_val, "screen_band": band,
+            "counts": {k: len(v) for k, v in buckets.items()}, "buckets": buckets}
 
 
 # --- Composite dashboard endpoint (one round-trip + short TTL cache) ---------
