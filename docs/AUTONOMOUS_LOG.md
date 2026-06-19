@@ -7,6 +7,54 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Dashboard was BROKEN (stale dev-server mess) — cleaned to one server
+
+**Caught the visibility layer down by actually clicking around (the mandate).** I'd
+been verifying only `/voidbase` for many fires; this fire I checked the other pages
+and found `/research` rendering UNSTYLED (raw serif HTML, no Tailwind) with data
+stuck on "Loading…" and a console `Unexpected token '<' … not valid JSON` (a fetch
+getting an HTML error page instead of JSON). The whole voidspark app was effectively
+broken.
+
+**Root cause:** the Next dev server was a pile of STALE processes — many
+`next-server` instances accumulated (from restart attempts across fires + my own this
+fire), fighting over port 3000, so requests hit a half-dead/old-build instance.
+`lsof -ti:3000`, `ps | grep next` showed ~11 next processes. **Fix:** killed them ALL,
+freed ports 3000/3001/3002, started exactly ONE fresh `npm run dev`. Verified in
+Chrome: `/research` now renders fully styled — Confirm gate (with the
+CONFIRMED-READY-TO-PROMOTE panel), a "Recent search" list of every tested mechanism
+with deltas — zero console errors. The API proxy returns valid JSON again.
+
+Live research seen on the restored page: SwiGLU confirm now **4/6** (advancing);
+the 2 confirmed challengers still surfaced as ready-to-promote.
+
+**Self-critique**
+- *I made it worse before better.* The trigger was a single `/` → 000 (a transient
+  dev-compile timeout — `/` actually serves 200 in 4.4s once compiled). I overreacted
+  and spawned 2-3 redundant `npm run dev` servers, which landed on 3001/3002 and
+  thickened the mess. I should have FIRST checked `lsof -ti:3000` / `ps | grep next`
+  before ever starting a server. Diagnose the process table before acting on it —
+  same lesson as the duplicate-daemons fire, not learned.
+- *No supervision for the dev server either.* Like the daemons, it's a bare
+  `nohup npm run dev` with no restart policy, so it dies/duplicates silently between
+  fires and the dashboard goes dark unnoticed. `loop_status.py` checks the API + box
+  but NOT the voidspark dev server — a real gap, since that's the human's window.
+- *I burned a fire on ops, not building.* Legitimate (the dashboard being down is a
+  real outage), but the avoidable-overreaction part cost time.
+
+**Operational note for future fires (cross-fire memory):** there should be EXACTLY
+ONE `npm run dev` on :3000. Before starting one, run `lsof -ti:3000` — if it's taken,
+the server is already up; do NOT spawn another. If the dashboard renders unstyled or
+"Loading…" forever, it's the stale-multi-server bug: `ps aux | grep next | awk '{print $2}' | xargs kill -9`, free the port, start one.
+
+**Next moves (priority order)**
+1. **Add a voidspark check to `loop_status.py`** — GET localhost:3000/voidbase and
+   flag if down or duplicated, so the dashboard outage is caught automatically.
+2. **SwiGLU verdict** (4/6 → 6/6) → confirmed-seed stack round.
+3. Bound infra retries; psycopg_pool.
+
+---
+
 ## 2026-06-19 · feeder --seed-from confirmed (sharper stacking) + slowness diagnosed
 
 **Built the logged stack-quality fix and ruled out a feared bug.**

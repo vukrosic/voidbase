@@ -43,6 +43,27 @@ def _get(path: str, timeout: int = 12):
         return None
 
 
+VOIDSPARK_URL = os.environ.get("VOIDSPARK_URL", "http://localhost:3000")
+
+
+def voidspark_status() -> dict:
+    """Is the operator's dashboard actually up and SINGLE? A GET to /voidbase that
+    returns 2xx/3xx means a server answers; the process count flags the stale-
+    multi-server bug (several `next dev` fighting over :3000 → broken renders)."""
+    ok = False
+    try:
+        req = urllib.request.Request(f"{VOIDSPARK_URL}/voidbase", method="GET")
+        with urllib.request.urlopen(req, timeout=12) as r:
+            ok = 200 <= r.status < 400
+    except Exception as e:  # noqa: BLE001 — a redirect (308) raises in urllib; treat as up
+        ok = "308" in str(e) or "301" in str(e) or "302" in str(e)
+    ps = _procs()
+    n = len([ln for ln in ps.splitlines()
+             if "next-server" in ln or "next dev" in ln])
+    return {"url": VOIDSPARK_URL, "reachable": ok, "server_count": n,
+            "ok": ok and n <= 2}  # one `npm run dev` spawns ~1-2 procs
+
+
 def _procs() -> str:
     try:
         return subprocess.run(["ps", "axo", "pid,command"], capture_output=True,
@@ -104,6 +125,7 @@ def collect() -> dict:
     return {
         "api": API,
         "daemons": daemon_status(ps_text),
+        "voidspark": voidspark_status(),
         "boxes": box_health(health),
         "queue": queue,
         "in_flight": [{"name": j.get("name"), "box": j.get("box"),
@@ -133,6 +155,11 @@ def _fmt(s: dict) -> str:
     for d in s["daemons"]:
         extra = "" if d["ok"] else f"  <-- expected 1, found {d['count']} {d['pids']}"
         L.append(f"    {ok(d['ok'])}{d['name']:16s} x{d['count']}{extra}")
+    vs = s.get("voidspark") or {}
+    vs_msg = ("up" if vs.get("reachable") else "DOWN")
+    if vs.get("server_count", 0) > 2:
+        vs_msg += f"  !! {vs['server_count']} dev procs (stale-multi-server bug — kill all, start one)"
+    L.append(f"  {ok(vs.get('ok'))}voidspark dashboard ({vs.get('url')}): {vs_msg}")
     L.append("  boxes:")
     for b in s["boxes"]:
         age = b["heartbeat_age_s"]
@@ -169,7 +196,8 @@ def main() -> int:
     print(json.dumps(s, indent=2, default=str) if as_json else _fmt(s))
     # exit non-zero if the loop is unhealthy (API down or a daemon miscount) so a
     # wrapper/cron can alert on it.
-    healthy = s["api_reachable"] and all(d["ok"] for d in s["daemons"])
+    healthy = (s["api_reachable"] and all(d["ok"] for d in s["daemons"])
+               and (s.get("voidspark") or {}).get("ok", True))
     return 0 if healthy else 1
 
 
