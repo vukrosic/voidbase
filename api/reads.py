@@ -444,11 +444,30 @@ def gate(scope: str) -> dict:
         {"name": v["name"], "run_id": v["run_id"], "agrees": v["agrees"],
          "delta": v["delta_from_original"], "at": str(v["created_at"])}
         for v in verdicts]
+    # CONFIRMED but not yet promoted — the actionable list. A run that PASSED its
+    # paired confirm (verification='confirmed') and still beats the live champion,
+    # but isn't the champion yet (promotion is a manual maintainer action — the
+    # daemon never auto-swaps). This is what the operator needs to SEE: "a verified
+    # improvement is waiting for you to promote it." Best (lowest val) first.
+    confirmed_pending = _pg_rows(
+        "select r.id, r.name, r.final_val_loss, cf.delta_from_original "
+        "from runs r join confirmations cf on cf.run_id = r.id "
+        "where r.thread_name = %s and cf.agrees = true "
+        "and r.final_val_loss is not null and r.final_val_loss < %s "
+        "and not exists (select 1 from champions ch "
+        "                where ch.run_id = r.id and ch.superseded_at is null) "
+        "order by r.final_val_loss asc", (scope, champ_val))
+    pending = [
+        {"id": r["id"], "name": r["name"], "val_loss": r["final_val_loss"],
+         "paired_delta": r["delta_from_original"],
+         "margin": round(champ_val - r["final_val_loss"], 4)}
+        for r in confirmed_pending]
     return {"scope": scope, "screen_band": voidcheck.SCREEN_BAND,
             "champion": {"run_id": champ["run_id"], "val_loss": champ_val,
                          "has_config": champ["has_config"]},
             "clears": clears, "near_miss": near_miss, "blocker": blocker,
-            "recent_verdicts": recent_verdicts}
+            "recent_verdicts": recent_verdicts,
+            "confirmed_pending": pending}
 
 
 # --- Composite dashboard endpoint (one round-trip + short TTL cache) ---------
