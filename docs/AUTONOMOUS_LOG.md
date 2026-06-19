@@ -7,6 +7,54 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Fix confirm-daemon cancelled-job deadlock (code, not just ops)
+
+**Shipped** — voidbase `06ed1b9`. Last fire I hand-fixed the canon_conv confirm that
+was frozen at 4/6 (2 cancelled jobs). This fire fixed the underlying BUG so it can't
+recur: confirm_daemon Phase B now detects cancelled jobs in a candidate's confirm set
+and re-queues them (new `requeue_confirm_jobs`: status→needs-run, claim cleared,
+guarded on `status='cancelled'`), skipping the judge that cycle so the worker
+completes the set. Without it, any confirm job cancelled mid-flight (box outage,
+reaper sweep, manual) freezes the candidate at <6/6 forever — it never becomes
+done/failed, the only states the terminal check counts. +2 unit tests (fake conn);
+10 pass. Restarted the daemon with `python -u` so its logs are unbuffered (the buffer
+fooled me two fires ago).
+
+Loop progress this fire (via the new `loop_status.py`):
+- **SwiGLU paired confirm DRAINING** — 1/6 running (cand-s42), 5 queued. The
+  autonomous confirm of the first real challenger is underway.
+- canon_conv confirm: 4 done + 2 needs-run (last fire's re-queue) → will reach 6/6
+  and finally get a verdict.
+- `use_qk_layernorm` **FAILED** (null val) — likely incompatible with the alibi
+  champion base (QK-LayerNorm vs the alibi/poly-alibi path). The loop recorded it
+  failed and moved on (graceful degradation working as designed). A negative/no-data
+  result, not a loop bug.
+
+**Self-critique**
+- *The fix re-queues but doesn't bound retries.* If a confirm job fails for a real
+  reason (a genuinely broken flag like qk_layernorm), re-queuing a CANCELLED one is
+  fine, but I should make sure I'm not creating a requeue→fail→requeue loop. I'm not
+  — the heal only touches `cancelled`, and a failed job is terminal (counts toward
+  judging), so a broken arm resolves as a rejected confirm, not an infinite loop.
+  Verified the logic, but it's worth a test for the failed-arm path too (didn't add).
+- *qk_layernorm failing silently-ish is a gap.* It's recorded `failed` with null val,
+  but I don't capture WHY (the box stderr isn't surfaced to the registry). A run that
+  fails to construct vs one that OOMs vs one that diverges are different stories; the
+  registry flattens them to "failed". Worth a `fail_reason` column someday.
+- *Restarted only confirm_daemon with -u, not worker/reaper* (worker is mid-run;
+  killing it loses SwiGLU's confirm job). They'll get -u on their next natural
+  restart. Inconsistent for now.
+
+**Next moves (priority order)**
+1. **SwiGLU verdict** — once its 6 confirm jobs are terminal, confirm_daemon judges
+   the paired 3-seed delta. THE research question: does +0.0139 hold paired? Watch it.
+2. **canon_conv verdict** — its confirm will also complete now; likely rejected
+   (my paired test said ~+0.0044, sub-band).
+3. **fail_reason capture** for failed runs (critique #2) — small schema + worker change.
+4. Keep feeding the untried space; psycopg_pool.
+
+---
+
 ## 2026-06-19 · 🎯 SwiGLU CLEARS THE BAND faithfully → autonomous paired confirm running
 
 **The autonomous research loop found and is now confirming a genuine new champion
