@@ -7,6 +7,57 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · 🏆 FIRST CONFIRMED CHALLENGER — canon_conv+cross_block_score_share
+
+**The autonomous loop produced its first paired-confirmed improvement over the
+champion, judged end-to-end with no human in the path.**
+
+`confirm_daemon` judged it this fire:
+> `use_canon_conv+use_cross_block_score_share` → **CONFIRMED** — paired 3/3 seeds,
+> cand mean **6.1605** vs champ 6.1720, **Δ −0.0114** (band 0.001), sign 3/3 favour
+> candidate. Per seed: s42 6.1544 vs 6.1762 (−0.0218); s123 6.1581 vs 6.1669
+> (−0.0088); s7 6.1691 vs 6.1728 (−0.0037).
+
+The candidate run is now `verification='confirmed'`; the gate dropped it from clears
+(SwiGLU remains, 1/6); **the champion stays 6.172 — the manual-promotion guardrail
+correctly did NOT auto-swap.** It's confirmation-ready for the human to promote
+(would lower the champion ~6.172 → ~6.16).
+
+**This CORRECTS my own earlier error.** Three fires ago I hand-ran a paired test of
+this exact combo and got +0.0044 (sub-band), concluding it was noise. WRONG — that
+was the ~0.019 config-drift from hand-rebuilding the champion+flag config. The
+*faithful* registry confirm (the real queue config, on the box, judged by the daemon)
+shows it's a genuine −0.0114 winner across all 3 seeds. Lesson, now burned in: trust
+ONLY the worker/queue pipeline's numbers, never a hand-reconstructed config.
+
+**Also this fire** (`d1e396b`, prior commit): SSH-drop resilience landed — keepalive +
+re-queue-on-infra-drop, so qk_layernorm-style losses retry instead of poisoning the
+search. 86 tests green.
+
+**Self-critique**
+- *I dismissed canon_conv combo as noise for two fires on bad (hand-config) data.*
+  The faithful pipeline existed the whole time; I should have trusted it over my
+  ad-hoc test the moment they disagreed, instead of asserting "sub-band." The
+  config-drift caveat was even in my own notes — I under-weighted it.
+- *"Search plateaued" was wrong for even longer.* The whole project inherited that
+  framing; it took enumerating the 177 flags (115 untried) + actually running them to
+  break it. Two confirmed/near-confirmed winners (canon_conv combo, SwiGLU) came out
+  of the "exhausted" space within hours of feeding it. Inherited conclusions deserve
+  a data check before they steer strategy.
+- *I'm respecting the promotion guardrail* (not swapping the champion), which is
+  correct — but the human has no signal yet that a confirmed challenger is WAITING.
+  A "confirmed, awaiting promotion" surface on the dashboard would close that gap
+  (the gate shows clears + verdicts but not "ready to promote"). Good next build.
+
+**Next moves (priority order)**
+1. **Surface "confirmed, awaiting promotion"** on the dashboard — the human needs to
+   see canon_conv combo is ready to become champion (guardrail = their call).
+2. **SwiGLU verdict** (1/6 → 6/6) — a SECOND confirmed challenger likely incoming.
+3. Keep feeding the untried space (the strategy is now proven to yield winners).
+4. Bound infra retries; psycopg_pool.
+
+---
+
 ## 2026-06-19 · Root-caused a spurious failure → SSH-drop resilience (keepalive + retry)
 
 **Read the log instead of guessing, found the real bug, fixed it.** Last two fires I
