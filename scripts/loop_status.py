@@ -110,7 +110,14 @@ def collect() -> dict:
                        "age_s": j.get("age_s")} for j in in_flight],
         "champion": {"scope": CHAMP_SCOPE, "val_loss": champ_val},
         "gate_blocker": (gate or {}).get("blocker"),
-        "gate_clears": [c.get("name") for c in (gate or {}).get("clears", [])],
+        # Each band-clearing candidate + its live paired-confirm progress (X/6) —
+        # the single most useful "where is the research right now" signal.
+        "gate_clears": [
+            {"name": c.get("name"), "margin": c.get("margin"),
+             "confirm": (f"{c['confirm']['terminal']}/{c['confirm']['total']}"
+                         if c.get("confirm") else None)}
+            for c in (gate or {}).get("clears", [])
+        ],
         "recent_runs": recent[:8],
         "api_reachable": health is not None,
     }
@@ -139,7 +146,11 @@ def _fmt(s: dict) -> str:
     cv = s["champion"]["val_loss"]
     L.append(f"  champion ({s['champion']['scope']}): {cv}")
     if s["gate_clears"]:
-        L.append(f"  GATE CLEARS (leads): {', '.join(s['gate_clears'])}")
+        L.append(f"  GATE CLEARS — {len(s['gate_clears'])} lead(s) in paired confirm:")
+        for c in s["gate_clears"]:
+            m = f"+{c['margin']:.4f}" if c.get("margin") is not None else "?"
+            prog = f"confirm {c['confirm']}" if c.get("confirm") else "no confirm yet"
+            L.append(f"    {(c['name'] or '?')[:44]:44s} {m:8s} {prog}")
     elif s["gate_blocker"]:
         L.append(f"  gate blocker: {s['gate_blocker'][:70]}")
     if s["recent_runs"]:
