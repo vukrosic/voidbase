@@ -6,7 +6,29 @@ round-trip — without one.
 """
 import unittest
 
-from scripts.confirm_daemon import _confirm_qid, _parse_arm_seed, paired_verdict, SEEDS
+from scripts.confirm_daemon import (
+    _confirm_qid, _parse_arm_seed, paired_verdict, requeue_confirm_jobs, SEEDS,
+)
+
+
+class _FakeCursor:
+    def __init__(self):
+        self.calls = []
+
+    def executemany(self, sql, params):
+        self.calls.append((sql, list(params)))
+
+
+class _FakeConn:
+    def __init__(self):
+        self._cur = _FakeCursor()
+        self.commits = 0
+
+    def cursor(self):
+        return self._cur
+
+    def commit(self):
+        self.commits += 1
 
 
 def _jobs(cand, base):
@@ -52,6 +74,30 @@ class PairedVerdictTest(unittest.TestCase):
     def test_within_band_rejects(self):
         v = paired_verdict(_jobs([6.0995, 6.1195, 6.0795], [6.10, 6.12, 6.08]), 0.001)
         self.assertFalse(v["agrees"])
+
+
+class RequeueConfirmJobsTest(unittest.TestCase):
+    """The cancelled-job deadlock auto-heal: cancelled confirm jobs must be put
+    back to needs-run (guarded on status='cancelled') so a box outage can't freeze
+    a candidate at <6/6 forever."""
+
+    def test_requeues_each_cancelled_job_guarded(self):
+        conn = _FakeConn()
+        n = requeue_confirm_jobs(conn, ["confirm-x-cand-s7", "confirm-x-base-s42"])
+        self.assertEqual(n, 2)
+        self.assertEqual(conn.commits, 1)
+        sql, params = conn._cur.calls[0]
+        # restores to runnable, clears the claim, and only touches cancelled rows
+        self.assertIn("status='needs-run'", sql.replace(" ", ""))
+        self.assertIn("status='cancelled'", sql.replace(" ", ""))
+        self.assertEqual(params, [("confirm-x-cand-s7",), ("confirm-x-base-s42",)])
+
+    def test_empty_is_noop(self):
+        conn = _FakeConn()
+        n = requeue_confirm_jobs(conn, [])
+        self.assertEqual(n, 0)
+        self.assertEqual(conn._cur.calls, [])
+        self.assertEqual(conn.commits, 0)
 
 
 class ConfirmQueueIdTest(unittest.TestCase):

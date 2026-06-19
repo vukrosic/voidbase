@@ -231,6 +231,23 @@ def confirm_jobs(conn, run_id: str) -> list[dict]:
     return out
 
 
+def requeue_confirm_jobs(conn, qids: list[str]) -> int:
+    """Return cancelled confirm jobs to the runnable pool (status -> needs-run,
+    claim fields cleared). Each row still carries its own config, so the worker can
+    re-run it as-is. Guarded on status='cancelled' so a concurrent claim/run is never
+    clobbered. The auto-heal for the cancelled-job confirm deadlock (see Phase B)."""
+    if not qids:
+        return 0
+    cur = conn.cursor()
+    cur.executemany(
+        """update queue_items set status='needs-run', claimed_by_box=null,
+               claimed_at=null, lease_expires_at=null
+           where id=%s and status='cancelled'""",
+        [(q,) for q in qids])
+    conn.commit()
+    return len(qids)
+
+
 # --- phase A: enqueue a paired confirm ---------------------------------------
 
 def _arm_config(base_config: dict, seed: int) -> dict:
@@ -354,6 +371,18 @@ def poll_cycle(conn, args, contributor_id: str) -> dict:
                 f"by {champ['val_loss'] - c['final_val_loss']:.4f}) -> {n} jobs")
             continue
         # Phase B: confirm in flight — judge once all 6 are terminal.
+        # Self-heal first: a CANCELLED confirm job (box went dark mid-confirm, a
+        # reaper sweep, a manual cancel) never becomes done/failed, so without this
+        # the candidate freezes at <6/6 FOREVER and is never judged. Re-queue any
+        # cancelled job so the worker completes the set; skip judging this cycle and
+        # let them run. (Found the hard way: the canon_conv confirm was stuck at 4/6
+        # for days because 2 jobs were cancelled when the box went offline.)
+        cancelled = [j for j in jobs if j["qstatus"] == "cancelled"]
+        if cancelled:
+            requeue_confirm_jobs(conn, [j["qid"] for j in cancelled])
+            log(f"{c['id']} confirm had {len(cancelled)} cancelled job(s) — "
+                f"re-queued to unstick (would otherwise freeze at <6/6 forever)")
+            continue
         expected = 2 * len(SEEDS)
         terminal = [j for j in jobs if j["qstatus"] in ("done", "failed")]
         if len(jobs) >= expected and len(terminal) == len(jobs):
