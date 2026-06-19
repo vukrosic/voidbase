@@ -315,10 +315,37 @@ def run_on_box(remote_cmd: str):
         "-o", "ConnectTimeout=20",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "BatchMode=yes",
+        # Keepalives so a multi-minute training run doesn't get dropped by an idle
+        # NAT/firewall or a brief network blip: ping every 30s, tolerate ~5 min of
+        # silence (10 misses) before giving up. A dropped run is wasted GPU + a
+        # spurious "failed" (a real qk_layernorm run was lost this way).
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=10",
         f"{BOX_SSH_USER}@{BOX_SSH_HOST}", remote_cmd,
     ]
     proc = subprocess.run(ssh, capture_output=True, text=True, timeout=JOB_TIMEOUT)
     return proc.returncode, (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+
+# Markers that a run FAILED because the SSH/box connection dropped — an infra
+# blip, NOT a training failure. Such a job never got a fair shot, so it must be
+# RE-QUEUED (retried), not recorded as a failed experiment (which would poison the
+# search's signal and dedup-block a real retry). A genuine training crash instead
+# exits 0/1 with a Python traceback and is a real `failed`.
+_INFRA_FAIL_MARKERS = (
+    "closed by remote host", "Connection to", "kex_exchange",
+    "Connection reset", "Connection timed out", "Broken pipe",
+    "Connection closed", "client_loop",
+)
+
+
+def is_transient_infra_failure(rc: int, out: str) -> bool:
+    """True when a non-OK run looks like an SSH/box drop rather than a training
+    failure. rc 255 is ssh's own connection-error code; the markers catch the same
+    in the captured output. Pure — unit-tested."""
+    if rc == 255:
+        return True
+    return any(m in (out or "") for m in _INFRA_FAIL_MARKERS)
 
 
 def run_one(repo: Path, box_id: str) -> bool:
@@ -375,6 +402,21 @@ def run_one(repo: Path, box_id: str) -> bool:
                         "claimed_by_box=null, claimed_at=null, lease_expires_at=null "
                         "where id=%s", (job["id"],))
             conn.commit()
+            return True
+        # An SSH/box drop is an infra failure, not a verdict: the experiment never
+        # produced a result, so re-queue it to retry instead of poisoning the search
+        # with a spurious `failed` (and dedup-blocking the real run). Only when no
+        # val_loss was parsed — if the run actually finished and THEN the connection
+        # dropped, we still have the result and should record it.
+        if (not ok and parse_val_loss(out) is None
+                and is_transient_infra_failure(rc, out)):
+            cur = conn.cursor()
+            cur.execute("update queue_items set status='needs-run', started_at=null, "
+                        "claimed_by_box=null, claimed_at=null, lease_expires_at=null "
+                        "where id=%s", (job["id"],))
+            conn.commit()
+            log(f"{job['id']} infra failure (rc={rc}, connection dropped) — "
+                f"RE-QUEUED, not recording as failed")
             return True
         report(conn, job, box_id, ok,
                parse_val_loss(out), remote_cmd, out[-2000:],
