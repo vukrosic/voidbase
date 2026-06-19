@@ -95,15 +95,28 @@ def already_seen(conn) -> set[str]:
 
 
 def winning_singles(conn, champ_val: float, candidates: list[str],
-                    top_k: int, min_margin: float) -> list[str]:
+                    top_k: int, min_margin: float,
+                    confirmed_only: bool = False) -> list[str]:
     """The single-flag mechanisms that genuinely beat the champion — best-first.
 
     A flag qualifies iff its best run beat the champion by >= `min_margin` AND the
     result is PLAUSIBLE (not a forged/leaked metric). These are the levers worth
     STACKING: a directed C(winners, 2) search is where a real >band win hides once
-    the singles plateau, vs blind C(all, 2) ≈ thousands of mostly-noise pairs."""
+    the singles plateau, vs blind C(all, 2) ≈ thousands of mostly-noise pairs.
+
+    `confirmed_only` tightens "winner" from *beats-champion-on-val* (one unpaired
+    run, which can be seed-luck — e.g. gmlp_sgu screened in but was paired-REJECTED)
+    to *passed a paired 3-seed confirm*. Once confirmations exist, this spends the
+    C(winners,2) GPU budget only on mechanisms proven real, not on screen-noise."""
     cand = set(candidates)
     cur = conn.cursor()
+    confirmed_names: set[str] | None = None
+    if confirmed_only:
+        cur.execute(
+            "select distinct r.name from confirmations c "
+            "join runs r on r.id = c.run_id "
+            "where r.thread_name=%s and c.agrees=true", (THREAD,))
+        confirmed_names = {row[0] for row in cur.fetchall()}
     cur.execute(
         "select name, min(final_val_loss) from runs "
         "where thread_name=%s and final_val_loss is not null group by name",
@@ -112,6 +125,8 @@ def winning_singles(conn, champ_val: float, candidates: list[str],
     for name, val in cur.fetchall():
         if not name or name not in cand:  # real single structural lever only
             continue
+        if confirmed_names is not None and name not in confirmed_names:
+            continue  # not paired-confirmed — skip (seed only from proven winners)
         val = float(val)
         if is_implausible_win(val, champ_val):  # reject leaks/forgeries at the source
             continue
@@ -168,6 +183,11 @@ def main() -> int:
     ap.add_argument("--min-margin", type=float, default=0.0,
                     help="[stack] a single must beat the champion by >= this to "
                          "seed a pair (default 0.0 = any genuine win)")
+    ap.add_argument("--seed-from", choices=["beats", "confirmed"], default="beats",
+                    help="[stack] which singles seed the C(winners,2) pairs: "
+                         "'beats' = any single that beats the champion on val (default; "
+                         "back-compat); 'confirmed' = only singles that PASSED a paired "
+                         "3-seed confirm (no screen-noise like the rejected gmlp_sgu)")
     ap.add_argument("--dry", action="store_true", help="show what would enqueue, write nothing")
     args = ap.parse_args()
     repo = Path(args.repo)
@@ -192,7 +212,8 @@ def main() -> int:
                       file=sys.stderr)
                 return 1
             winners = winning_singles(conn, float(champ_val), flags,
-                                      args.top_k, args.min_margin)
+                                      args.top_k, args.min_margin,
+                                      confirmed_only=(args.seed_from == "confirmed"))
             if len(winners) < 2:
                 print(f"[feeder] stack: only {len(winners)} proven winner(s) over "
                       f"the champion (need >=2 to pair) — nothing to stack",

@@ -1,0 +1,74 @@
+"""Pure-logic test for feeder.winning_singles — no live DB.
+
+Covers the `confirmed_only` seed filter for stack mode: it must pair the search's
+compounding experiments only from singles that PASSED a paired confirm, not from
+ones that merely screened below the champion once (which can be seed-luck — the
+real gmlp_sgu screened in but was paired-REJECTED). A fake cursor returns canned
+rows for the two queries winning_singles issues.
+"""
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from scripts.feeder import winning_singles  # noqa: E402
+
+
+class _FakeCursor:
+    """Answers winning_singles' two queries in order: (1) confirmed names [only
+    when confirmed_only], (2) name -> min(val). The query text decides which."""
+
+    def __init__(self, confirmed: list[str], vals: dict[str, float]):
+        self._confirmed = [(n,) for n in confirmed]
+        self._vals = [(n, v) for n, v in vals.items()]
+        self._last = None
+
+    def execute(self, sql, params=None):
+        self._last = "confirmed" if "c.agrees=true" in sql else "vals"
+
+    def fetchall(self):
+        return self._confirmed if self._last == "confirmed" else self._vals
+
+
+class _FakeConn:
+    def __init__(self, cur):
+        self._cur = cur
+
+    def cursor(self):
+        return self._cur
+
+
+CHAMP = 6.172
+# canon_conv + gmlp_sgu both beat the champion on val; only canon_conv is confirmed.
+VALS = {"use_canon_conv": 6.1584, "use_gmlp_sgu": 6.1597, "use_swiglu_ffn": 6.1581}
+CANDS = list(VALS)
+
+
+class WinningSinglesSeedFromTest(unittest.TestCase):
+    def test_beats_mode_includes_unconfirmed(self):
+        conn = _FakeConn(_FakeCursor(confirmed=["use_canon_conv"], vals=VALS))
+        out = winning_singles(conn, CHAMP, CANDS, top_k=8, min_margin=0.0,
+                              confirmed_only=False)
+        # all three beat the champion; best-first by margin
+        self.assertEqual(set(out), {"use_canon_conv", "use_gmlp_sgu", "use_swiglu_ffn"})
+        self.assertEqual(out[0], "use_swiglu_ffn")  # lowest val => biggest margin
+
+    def test_confirmed_mode_keeps_only_confirmed(self):
+        conn = _FakeConn(_FakeCursor(confirmed=["use_canon_conv"], vals=VALS))
+        out = winning_singles(conn, CHAMP, CANDS, top_k=8, min_margin=0.0,
+                              confirmed_only=True)
+        self.assertEqual(out, ["use_canon_conv"])  # gmlp_sgu/swiglu not yet confirmed
+
+    def test_confirmed_mode_pairs_once_two_confirmed(self):
+        conn = _FakeConn(_FakeCursor(
+            confirmed=["use_canon_conv", "use_swiglu_ffn"], vals=VALS))
+        out = winning_singles(conn, CHAMP, CANDS, top_k=8, min_margin=0.0,
+                              confirmed_only=True)
+        self.assertEqual(set(out), {"use_canon_conv", "use_swiglu_ffn"})
+
+
+if __name__ == "__main__":
+    unittest.main()
