@@ -7,6 +7,50 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Live research verified on the dashboard; SwiGLU confirm progressing
+
+**A verify + tooling fire — the loop is doing the research autonomously, so this
+confirmed it's working and sharpened the monitoring.**
+
+- **Verified the full live research story renders** (`/voidbase`, Chrome, zero
+  console errors): champion lineage → Confirm gate showing **CLEARS BAND (2)** with
+  `canon_conv+cross_block_score_share` confirming 4/6 (+0.0176) and **`use_swiglu_ffn`
+  confirming 1/6 (+0.0139)** → "Gate live — 2 candidates in paired confirm" → recent
+  verdicts. The autonomously-discovered SwiGLU lead is visibly being paired-confirmed.
+- **SwiGLU confirm IS progressing** (1/6 — cand-s42 landed), just slowly: ~8 min/job
+  on the 3060, so the full 6-job verdict is ~40 min out. Diagnosed the apparent
+  "stuck" as just slow: box healthy (1 GPU app, clean memory, load ~1.0; the 7
+  run_experiment procs are one run's dataloader workers). Reaper had one transient
+  Neon timeout — skipped that sweep gracefully, no harm.
+- **Enhanced `loop_status.py`** (commit `be485d4`): GATE CLEARS now shows each lead's
+  margin + live confirm X/6 (e.g. `use_swiglu_ffn +0.0139 confirm 1/6`), so the
+  research frontier is one command.
+
+**Self-critique**
+- *~8 min/job is the real throughput ceiling now.* The search does 6 jobs/confirm +
+  exploration, serially, one box. A confirm takes ~50 min; mining 97 untried flags is
+  ~13h. The lever isn't more monitoring — it's faster runs (is the per-run dataset
+  load / model build re-paid every run? worth profiling) or a second box (a human
+  rental decision). I keep verifying the loop; the bottleneck is throughput.
+- *This fire shipped little NEW capability* — a tooling tweak + verification. Justified
+  (the loop is autonomous and needed confirming, the mandate says test through Chrome),
+  but I should bias toward the throughput question or the `fail_reason` build next,
+  not another monitoring pass.
+- *qk_layernorm's failure is still unexplained* (logged last fire). Two pri-9 leads
+  queued, one cleared (SwiGLU), one failed (qk_layernorm) — a 50% construct-failure
+  rate on hand-picked flags suggests some untried flags are incompatible with the
+  alibi base; `fail_reason` capture would turn that from a guess into data.
+
+**Next moves (priority order)**
+1. **SwiGLU verdict** (~40 min out) — does +0.0139 hold paired across 3 seeds?
+2. **`fail_reason` capture** — turn opaque `failed` runs into diagnosable ones
+   (why qk_layernorm died); small worker + schema change, real signal.
+3. **Profile per-run overhead** — if dataset load/compile is re-paid each run, caching
+   it could ~2x search throughput (the actual bottleneck).
+4. psycopg_pool.
+
+---
+
 ## 2026-06-19 · Fix confirm-daemon cancelled-job deadlock (code, not just ops)
 
 **Shipped** — voidbase `06ed1b9`. Last fire I hand-fixed the canon_conv confirm that
