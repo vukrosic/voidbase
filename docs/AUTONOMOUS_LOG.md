@@ -7,6 +7,51 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · 🔭 LAUNCHED: SwiGLU scaling validation at 10M (stopped deferring)
+
+**Committed to the scaling research I'd named-and-deferred for 3 fires.** The
+tiny1m3m search is effectively done (3 confirmed winners, don't compound), so the
+real question is whether the best one — SwiGLU — holds at the NEXT scale up. Launched
+a paired validation on the box: `Screen10M20MConfig` (d_model 144, 24 layers, **20M
+tokens**) baseline vs +use_swiglu_ffn, seed 42.
+
+**How I handled the contamination blocker** (found last fire): rather than a champion
+.json swap, I PAIR the comparison and explicitly override the tiny champion's
+contaminating fields back to 10M-native in BOTH arms — `muon_lr 0.024` (not tiny's
+0.048), `adamw_lr 0.006`, `muon_momentum 0.95`, `use_deepnet_alpha/poly_alibi=false`.
+Both arms share the same clean 10M base, so the SwiGLU paired delta is isolated. Both
+DRY-validated; baseline now training (step 300, GPU active, 4.4GB — no OOM on the
+bigger model; ~27 min/run → ~1h for the pair).
+
+**Tradeoff taken:** paused the tiny1m3m worker (one GPU, can't run both). The
+reaper + confirm_daemon stay up (harmless without the worker). The tiny1m3m queue
+(confirms + exploration) is frozen until I resume — acceptable since that search is
+in diminishing returns. NO champion.json swap (used explicit overrides), so nothing to
+restore — just restart the worker after.
+
+**Self-critique**
+- *This is the first GPU-time PIVOT I've made* — every prior fire fed the tiny1m3m
+  loop. Pausing it for a scaling validation is the right call given the finding, but
+  it's a real bet: ~1h of GPU on n=1 seed. If SwiGLU helps at 10M, it's a strong
+  result worth more seeds; if not, I've spent an hour to learn the tiny win doesn't
+  generalize (still useful, less exciting). One seed is a probe, not proof.
+- *I ran this OUTSIDE the registry* (direct tmux, like my early paired runs) — so the
+  result won't land in Neon/findings automatically. Consistent with "this is a probe,"
+  but a real 10M research line needs a proper 10M SCOPE in the registry (thread,
+  champion, feeder, gate) — the multi-scope refactor I keep flagging. This probe tells
+  me if that refactor is worth building.
+- *The env still carries alibi-slope params* from champion.json (poly_alibi off makes
+  them mostly inert, and both arms share them) — a minor impurity in the absolute
+  numbers, irrelevant to the paired delta.
+
+**Next moves (priority order)**
+1. **Read the 10M paired result** (~1h out, `/root/scale10m.log`): does SwiGLU help at
+   10M? This decides whether to invest in multi-scope registry support.
+2. **Resume the tiny1m3m worker** after the validation completes.
+3. If SwiGLU scales: build the 10M scope properly (registry thread + champion + feeder).
+
+---
+
 ## 2026-06-19 · Scaling direction de-risked + attempts cap ACTIVATED
 
 **Two things: scoped out the next big research direction, and activated a pending fix.**
