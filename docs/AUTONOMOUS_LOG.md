@@ -7,6 +7,59 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Root-caused a spurious failure → SSH-drop resilience (keepalive + retry)
+
+**Read the log instead of guessing, found the real bug, fixed it.** Last two fires I
+assumed `use_qk_layernorm` failed because the flag was incompatible with the alibi
+champion. WRONG. Its saved box log (`run-logs/auto-use_qk_layernorm-7c046c33.log`)
+ends at **"Connection to 1.208.108.242 closed by remote host"** — the SSH connection
+dropped mid-training (a vast.ai/network blip), so a multi-minute run was lost and
+recorded as a `failed` EXPERIMENT. That poisons the search signal and dedup-blocks a
+real retry.
+
+**Fix** — voidbase `d1e396b`, two parts:
+1. **SSH keepalive** in the worker (`ServerAliveInterval=30`, `ServerAliveCountMax=10`)
+   so a long run isn't dropped by an idle NAT/firewall or a brief blip (tolerates
+   ~5 min of silence).
+2. **`is_transient_infra_failure(rc, out)`** — a non-OK run that parsed NO val_loss
+   and looks like a drop (rc 255 / "closed by remote host" / "Broken pipe" / …) is
+   **RE-QUEUED to retry**, not reported failed. A genuine training crash (traceback,
+   val parsed) still records as `failed`. +5 unit tests; **86 pass** (whole suite).
+
+Applied via a clean worker restart (now `python -u`, unbuffered): requeued the
+orphaned in-flight job + qk_layernorm (the drop victim). Worker re-claimed instantly;
+`failed` count 16→14. Loop healthy, one of each daemon.
+
+**Live research:** canon_conv+cross_block_score_share confirm now **5/6** (base-s42
+running → 6/6 → judged imminently); SwiGLU 1/6. The canon_conv verdict lands next.
+
+**Self-critique**
+- *I guessed "incompatible flag" twice without reading the saved log.* The worker
+  ALREADY persists full box output per run (`run-logs/<job>.log`) — exactly for this
+  — and I ignored it for two fires. The data to root-cause was one `tail` away. When
+  a run fails, READ ITS LOG before theorizing.
+- *The infra-failure retry has no attempt cap.* A box that's genuinely down would
+  re-queue → drop → re-queue forever. The reaper + the box going `offline` (no
+  heartbeat) is a partial backstop, but a real fix bounds retries (e.g. a
+  `attempts` counter on the queue row, fail after N). Logged.
+- *I requeued `like '%qk_layernorm%' and failed`, which also matched an OLD
+  `282-deepnet-rope-base-qk-layernorm`* — harmless (it just re-runs), but sloppy
+  targeting; I should have matched the exact id.
+- *`fail_reason` capture is now LESS urgent* — the real lesson was "read the existing
+  run-log," not "add a column." The log already has the reason; the gap is that I
+  didn't look. A UI link to the run-log would close it better than a parsed column.
+
+**Next moves (priority order)**
+1. **canon_conv verdict** (imminent, 5/6) then **SwiGLU verdict** — the research
+   payoff. canon_conv likely rejects (~+0.0044 paired last test); SwiGLU is the hope.
+2. **Bound infra retries** (critique #2): an `attempts` cap so a dead box can't
+   spin a job forever.
+3. **Surface the run-log in the UI** (critique #4) — a link from a failed run to its
+   saved box output, so failures are one click to diagnose.
+4. Profile per-run throughput; psycopg_pool.
+
+---
+
 ## 2026-06-19 · Live research verified on the dashboard; SwiGLU confirm progressing
 
 **A verify + tooling fire — the loop is doing the research autonomously, so this
