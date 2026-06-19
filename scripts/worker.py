@@ -50,6 +50,10 @@ from db.conn import connect, env_value  # noqa: E402
 DEFAULT_REPO = Path("/Users/vukrosic/my-life/llm-research-kit-scaling")
 LEASE_SECONDS = int(os.environ.get("VOIDBASE_LEASE_SECONDS", "1800"))
 JOB_TIMEOUT = int(os.environ.get("VOIDBASE_JOB_TIMEOUT", "900"))
+# How many SSH/box-drop re-queues a single job gets before the worker gives up and
+# records it `failed`. Bounds the infra-retry loop (queue_items.attempts, migration
+# 0010) so a dead box can't cycle a job forever. 3 = two free retries past the first.
+MAX_INFRA_ATTEMPTS = int(os.environ.get("VOIDBASE_MAX_INFRA_ATTEMPTS", "3"))
 THREAD_FALLBACK = "tiny1m3m"
 
 # --- GPU box: experiments TRAIN on the rented box via SSH, never locally ------
@@ -411,13 +415,26 @@ def run_one(repo: Path, box_id: str) -> bool:
         if (not ok and parse_val_loss(out) is None
                 and is_transient_infra_failure(rc, out)):
             cur = conn.cursor()
-            cur.execute("update queue_items set status='needs-run', started_at=null, "
-                        "claimed_by_box=null, claimed_at=null, lease_expires_at=null "
-                        "where id=%s", (job["id"],))
+            # Count the infra failure; give up after the cap so a genuinely dead box
+            # (accepts SSH then drops every run) can't cycle a job needs-run -> drop
+            # -> needs-run forever. Under the cap = re-queue (transient blip); at the
+            # cap = record `failed` for real (fall through to report) and free the slot.
+            cur.execute("update queue_items set attempts = attempts + 1 "
+                        "where id=%s returning attempts", (job["id"],))
+            row = cur.fetchone()
+            attempts = row[0] if row else MAX_INFRA_ATTEMPTS
+            if attempts < MAX_INFRA_ATTEMPTS:
+                cur.execute("update queue_items set status='needs-run', started_at=null, "
+                            "claimed_by_box=null, claimed_at=null, lease_expires_at=null "
+                            "where id=%s", (job["id"],))
+                conn.commit()
+                log(f"{job['id']} infra failure (rc={rc}, attempt "
+                    f"{attempts}/{MAX_INFRA_ATTEMPTS}) — RE-QUEUED")
+                return True
             conn.commit()
-            log(f"{job['id']} infra failure (rc={rc}, connection dropped) — "
-                f"RE-QUEUED, not recording as failed")
-            return True
+            log(f"{job['id']} infra failure (rc={rc}) hit the "
+                f"{MAX_INFRA_ATTEMPTS}-attempt cap — recording FAILED (box likely down)")
+            # fall through to report() with ok=False → a real `failed` row
         report(conn, job, box_id, ok,
                parse_val_loss(out), remote_cmd, out[-2000:],
                train_loss=parse_train_loss(out), val_accuracy=parse_val_accuracy(out))
