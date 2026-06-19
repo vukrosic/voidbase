@@ -7,6 +7,48 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Research fire: first compound result + qk_layernorm resolved (no UI)
+
+**Stayed on research per my own last-fire note.** Two real findings, no new views.
+
+- **First compounding result is in — and it does NOT compound.**
+  `swiglu_ffn+cross_block_score_share` = 6.1609, **+0.0111 single-seed**: clears the
+  band, but is slightly WORSE than swiglu alone (+0.0139 single / −0.0118 confirmed).
+  So stacking SwiGLU + cross_block_score_share is NOT super-additive — adding the
+  second mechanism doesn't help, maybe marginally hurts. Honest signal: the champion
+  lineage compounded for SOME mechanisms, but not every pair does. It still clears
+  the band, so confirm_daemon will paired-confirm it (likely lands ~champion-level).
+  swiglu+canon_conv (the two CONFIRMED singles) is queued pri 8, runs next — the
+  better test of whether confirmed mechanisms compound.
+- **qk_layernorm RESOLVED — the SSH fix works.** It failed once (the connection drop)
+  then **completed on retry: 6.1775** (−0.0055, HURTS — a real negative result, not
+  the flag incompatibility I'd guessed). One retry, succeeded, NO loop — so the
+  unbounded-infra-retry risk didn't bite, and the keepalive + re-queue fix from two
+  fires ago is validated end-to-end.
+- Prioritized the strongest compounds (swiglu+canon_conv → pri 8) so the
+  highest-signal experiments run before single-flag breadth.
+
+**Self-critique**
+- *Single-seed compound deltas are noisy* — swiglu+cross_block at +0.0111 vs swiglu
+  alone +0.0139 is within run-to-run variance, so "doesn't compound" is a LEAD, not a
+  verdict. The paired confirm will settle it. I should state it as "no evidence of
+  super-additivity yet," not a hard "doesn't compound."
+- *I spent most of the fire waiting* (~8 min across polls for one run). The result was
+  worth seeing live, but at ~7-8 min/run I can't watch every experiment — I should
+  check results opportunistically (next fire) rather than block. The loop produces
+  these autonomously regardless.
+- *No attempts-cap still* — qk_layernorm happened to succeed on retry 2, but a truly
+  dead box would still loop. Logged again; lower urgency now that one real case
+  self-healed, but not zero.
+
+**Next moves (priority order)**
+1. **swiglu+canon_conv result** (the two-confirmed compound) — the real test of
+   super-additivity. Check opportunistically next fire.
+2. **Bound infra retries** (attempts cap) — the last open robustness gap.
+3. Let the search keep draining; promotion is the human's call (3 confirmed waiting).
+
+---
+
 ## 2026-06-19 · 🏆 SwiGLU CONFIRMED (2nd challenger) + Findings panel on the dashboard
 
 **SwiGLU passed its paired confirm: Δ−0.0118** — the SECOND confirmed champion
