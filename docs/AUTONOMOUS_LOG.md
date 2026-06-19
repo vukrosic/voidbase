@@ -7,6 +7,52 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · 10M validation training (slow) — the 3060 caps practical scale
+
+**The 10M probe is healthy but reveals a compute ceiling.** The baseline is training
+fine (step 500, GPU 85%, 4.4 GB — no OOM), but MUCH slower than my ~27 min estimate:
+~38 steps/min × ~4880 steps (20M tokens ÷ batch 2 × seq 2048) = **~2h per run, ~4h for
+the paired probe**. So one single-seed 10M screening costs ~4h on the 3060; a 3-seed
+confirm (6 runs) would be ~12h.
+
+**Finding: the RTX 3060 caps practical research at the tiny1m3m scale.** tiny1m3m
+(1M params, 3M tokens) is ~7 min/run — fast enough to screen dozens of mechanisms and
+run 3-seed confirms. 10M (10M params, 20M tokens) is ~2h/run — fine for a ONE-TIME
+validation probe, but impractical for routine search or multi-seed confirms. So the
+right division of labor is: **screen on tiny1m3m (this box), validate the few winners
+at 10M occasionally, and any real 10M-scale SEARCH needs a faster box.** This also
+answers the "build multi-scope registry support?" question: NOT worth it for 10M on
+this hardware — the box can't sustain a 10M search loop. (Would be worth it if/when a
+bigger box is rented.)
+
+**Decision: let the one-shot probe finish** (it's the proper 20M-token 10M screening
+protocol, and the box is for research) and read the paired delta when done — that
+single answer ("does SwiGLU's tiny win survive at 10M?") is worth ~4h. NOT adding more
+seeds (the compute doesn't justify it for a probe). The tiny1m3m worker stays paused
+until it completes; I can't run tiny1m3m experiments meanwhile (one GPU), but I can
+do Mac-side software work.
+
+**Self-critique**
+- *My runtime estimate was 4× off* (~27 min → ~2h). I extrapolated from tiny1m3m's
+  token-rate without accounting for the bigger model (24 layers vs 12) being slower
+  PER token. Should have measured the 10M step-rate in the dry/first-30s before
+  committing the plan, not estimated from a different model size.
+- *Pausing the loop for 4h is a real opportunity cost* — but the tiny1m3m search is in
+  diminishing returns (the finding), so trading its tail for one scaling answer is
+  defensible. If the 10M probe is a clean negative, though, I'll have spent 4h + a
+  paused loop to confirm "doesn't scale," which stings. The bet is on a positive.
+- *I nearly flip-flopped* (considered killing + relaunching shorter, twice). New info
+  (2h/run) genuinely changed the calculus, but I resolved to NOT churn — let the
+  proper protocol run once. Decisiveness over re-optimizing mid-flight.
+
+**Next moves (priority order)**
+1. **Read the 10M paired result** when `/root/scale10m.log` shows both RESULTs (~4h /
+   several fires out): SwiGLU delta at 10M. The single most informative number pending.
+2. **Resume the tiny1m3m worker** once the probe finishes.
+3. Meanwhile (box busy): Mac-side software work, not GPU experiments.
+
+---
+
 ## 2026-06-19 · 🔭 LAUNCHED: SwiGLU scaling validation at 10M (stopped deferring)
 
 **Committed to the scaling research I'd named-and-deferred for 3 fires.** The
