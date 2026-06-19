@@ -7,6 +7,49 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · "Confirmed — ready to promote" surfaced on the dashboard
+
+**Closed the visibility gap from last fire: the human can now SEE the confirmed
+challengers waiting to be promoted.** The gate showed clears + verdicts, but a
+CONFIRMED-but-unpromoted run was only inferable from the verdict list — no
+actionable "this is ready, promote it" signal. Now there is one.
+
+- **API** (`98102cf`): `/gate` returns `confirmed_pending` — runs that PASSED their
+  paired confirm AND still beat the live champion AND aren't champion yet (promotion
+  is the manual maintainer step the daemon never automates), best-first with each
+  one's paired delta. Returns `canon_conv+cross_block_score_share` (Δ-0.0114) +
+  `canon_conv` (Δ-0.0101).
+- **UI** (`4165182`): an emerald "CONFIRMED — READY TO PROMOTE (N)" panel in the
+  confirm gate, directly under the champion, each row showing val + paired Δ, with an
+  inline note that promotion is manual. Tested through Chrome (renders both, zero
+  console errors, typecheck clean).
+
+Loop: SwiGLU confirm now 2/6 and climbing — a likely second confirmed challenger.
+
+**Self-critique**
+- *`confirmed_pending` overlaps the champion-lineage's job a bit.* A promoted
+  confirmed run becomes a champion (shown in the lineage); an unpromoted one shows
+  here. The boundary is "is it the current champion?" — clean, but two surfaces now
+  describe the confirmed set. Acceptable (they answer different questions: "what's the
+  history" vs "what's waiting"), but worth keeping coherent.
+- *There's no promote BUTTON* — by design (promotion is a guardrailed maintainer
+  action, and a one-click promote from a read-only dashboard would be the exact
+  auto-promotion the system forbids). But the operator still has to promote via CLI/
+  SQL; a guided "here's the command to promote this" hint would bridge read-only
+  visibility to action without breaking the guardrail. Didn't build it.
+- *Two confirmed challengers both stem from `canon_conv`* — the combo and the single.
+  Promoting the combo (better, -0.0114) likely subsumes the single. The panel lists
+  both equally; it could note "best" or that they're related. Minor.
+
+**Next moves (priority order)**
+1. **SwiGLU verdict** (2/6 → 6/6) — second confirmed challenger likely.
+2. **A "how to promote" hint** by the confirmed_pending panel (critique #2) — the
+   exact `sync_champions`/SQL command, so the human can act without guessing, while
+   promotion stays their explicit step.
+3. Keep feeding the untried space; bound infra retries; psycopg_pool.
+
+---
+
 ## 2026-06-19 · 🏆 FIRST CONFIRMED CHALLENGER — canon_conv+cross_block_score_share
 
 **The autonomous loop produced its first paired-confirmed improvement over the
