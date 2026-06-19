@@ -7,6 +7,48 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · findings.py — the research OUTPUT (what 58 mechanisms taught us)
+
+**Built the research conclusion view.** `loop_status` says if the loop runs;
+`scripts/findings.py` says what it FOUND — every tested structural mechanism binned
+by EVIDENCE strength (paired-confirmed = real; single-seed = suggestive only, the
+paired-vs-unpaired trap this platform exists to avoid). One registry read, no GPU.
+
+The search so far (58 mechanisms): **2 CONFIRMED** (canon_conv+cross_block_score_share
+Δ-0.0114, canon_conv Δ-0.0101), **1 LEAD** (swiglu_ffn +0.0139, mid-confirm), **1
+REJECTED** (gmlp_sgu, paired Δ-0.0020), 15 marginal (beat champ but in-band noise),
+31 neutral/worse, 1 implausible (broken metric), 7 failed. That's the honest picture:
+a 58-wide search has yielded ~2-3 real >band mechanisms — rare, but REAL, which is the
+whole point of the paired gate. `bucket_for()` is pure + unit-tested (+7; 96 suite).
+
+**Testing caught a real bug:** `use_conv_ffn` (val 0.4388 — a broken/forged metric)
+showed as the TOP "LEAD" with a +5.73 margin until I applied the same
+`voidcheck.is_implausible_win` screen the confirm daemon uses. Without it the findings
+view would headline garbage as the best result. Running the tool on real data (not
+just unit fakes) is what surfaced it.
+
+**Self-critique**
+- *findings + the /research "Recent search" list + the gate's confirmed_pending now
+  overlap* — three surfaces describing the same result set at different cuts
+  (research-conclusion CLI vs operational list vs actionable-promote panel). Coherent
+  but somewhat redundant; a single source (have the dashboard read findings' buckets)
+  would DRY it. Didn't unify — they answer subtly different questions.
+- *findings reads the DB directly* (like feeder/confirm), so it needs Mac creds — it's
+  an operator CLI, not something the dashboard can call. To surface buckets in the UI
+  I'd add a `/findings` API endpoint (the API has the DB connection). Logged.
+- *"15 marginal" is the real story and I under-emphasize it.* Most mechanisms that
+  "beat the champion" do so by <band — i.e. noise. The search's signal is thin; the
+  confirmed wins are the exception. findings makes this visible, which is honest but
+  sobering: the untried space has winners, but they're sparse.
+
+**Next moves (priority order)**
+1. **SwiGLU verdict** (4/6) — moves it confirmed or rejected in findings.
+2. **`/findings` API endpoint + a dashboard "Findings" surface** (critique #2) so the
+   research conclusion is visible, not just a CLI.
+3. Bound infra retries; psycopg_pool.
+
+---
+
 ## 2026-06-19 · Dashboard was BROKEN (stale dev-server mess) — cleaned to one server
 
 **Caught the visibility layer down by actually clicking around (the mandate).** I'd
