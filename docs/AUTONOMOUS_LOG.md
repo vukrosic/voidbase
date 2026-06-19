@@ -7,6 +7,50 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Stack-mode compounding search — combine the proven winners
+
+**Used the confirmed findings to DIRECT the next search round** — the compounding
+strategy that built the champion lineage (each champion stacked a new mechanism on
+the last). Instead of more single-flag exploration, `feeder.py --mode stack` pairs
+the singles that beat the champion: it found 5 winners (swiglu_ffn, canon_conv,
+cross_block_score_share, gmlp_sgu, av_output_carry) and enqueued 4 NEW combos at
+priority 6 (above single-flag exploration, below confirms):
+- `swiglu_ffn+canon_conv`, `swiglu_ffn+cross_block_score_share` (the two strongest
+  mechanisms combined), `swiglu_ffn+gmlp_sgu`, `swiglu_ffn+av_output_carry`.
+Dry-validated the two key ones on the box (DRY_OK) — a 3-mechanism stack (champion +
+2 flags) can hit incompatibilities (qk_layernorm did), so I checked before spending
+GPU. If `swiglu+cross_block_score_share` compounds past the band, it's a bigger lead
+than either alone — exactly the super-additive stacking the lineage shows.
+
+Queue order now: SwiGLU confirm (pri 100) → qk_layernorm (9) → stack pairs (6) →
+single-flag exploration (5). Confirms finish first, then compounding, then breadth.
+
+**Self-critique**
+- *Stack's "winners" = beats-champion-on-val (unpaired), not CONFIRMED.* `gmlp_sgu`
+  is in the winners list but was REJECTED on paired confirm. So a stack pair seeded
+  by gmlp_sgu spends GPU on a mechanism that's probably noise. Defensible (stack is
+  exploratory; the confirm gate filters the pairs later) but I could tighten stack to
+  seed only from CONFIRMED singles now that confirmations exist — a real feeder
+  improvement (`--seed-from confirmed`).
+- *I'm stacking on the OLD champion (6.172), not the confirmed canon_conv combo.*
+  Because promotion is pending (guardrail), the champion base is still the old one. So
+  `swiglu+canon_conv` is champion+swiglu+canon_conv, which is close to but not exactly
+  "best-confirmed + swiglu". Once the human promotes canon_conv combo, re-running
+  stack would compound from the new, higher baseline. Noted for post-promotion.
+- *Only 4 pairs from C(5,2)=10* — `--limit 4` + 6 already-tried. The swiglu pairs are
+  the freshest signal so that's the right 4, but I didn't enqueue the non-swiglu novel
+  combos (e.g. canon_conv+av_output_carry). Bounded deliberately to keep GPU focused.
+
+**Next moves (priority order)**
+1. **SwiGLU verdict** (confirm draining) — then its stack pairs run.
+2. **`feeder --mode stack --seed-from confirmed`** (critique #1) — seed compounding
+   only from paired-CONFIRMED singles, not unpaired-beats-champion, once enough
+   confirmations exist. Sharper GPU spend.
+3. **Re-stack after a promotion** from the new champion baseline (critique #2).
+4. Keep feeding; bound infra retries; psycopg_pool.
+
+---
+
 ## 2026-06-19 · "Confirmed — ready to promote" surfaced on the dashboard
 
 **Closed the visibility gap from last fire: the human can now SEE the confirmed
