@@ -7,6 +7,50 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · 🏆 SwiGLU CONFIRMED (2nd challenger) + Findings panel on the dashboard
+
+**SwiGLU passed its paired confirm: Δ−0.0118** — the SECOND confirmed champion
+challenger, and the BEST paired delta yet (edging canon_conv combo's −0.0114). The
+search now has **3 confirmed winners** awaiting promotion (swiglu_ffn, canon_conv+
+cross_block_score_share, canon_conv) — all surfaced on the dashboard's ready-to-
+promote panel. The `swiglu+canon_conv` compounding experiment was already queued
+(last fire's beats-stack), so `--seed-from confirmed` correctly found nothing new to
+add — the sharp combo is already on its way.
+
+**Shipped the Findings surface** (voidbase `3ea9ecb`, voidspark `c24d92d`): the
+research CONCLUSION is now on the dashboard, not just a CLI. `/findings` exposes
+`findings.py`'s buckets over HTTP (reusing the pure `bucket_for` — one classifier
+source); a compact `<FindingsSummary>` panel under the live gate shows the counts
+header + the confirmed/lead/rejected lists (the long marginal/neutral tails collapse
+to counts). Tested through Chrome: **58 tested · 3 confirmed · 1 rejected · 15
+marginal · 31 neutral · 7 failed**, zero console errors. The page now tells the whole
+story: champion → gate (live + ready-to-promote) → **findings (what works)** → ideas.
+
+**Self-critique**
+- *The dashboard is getting LONG.* champion-lineage, gate, findings, idea-backlog,
+  live-activity, runs, comparisons — 7 stacked panels. findings + gate's
+  confirmed_pending + recent-verdicts overlap (all show the confirmed set). It reads
+  as a coherent narrative top-to-bottom, but a tabbed or collapsible layout would
+  scale better than infinite vertical stacking. Deferred — it works, just dense.
+- *3 confirmed challengers, champion still unmoved.* The guardrail is right (promotion
+  is the human's), but the longer it sits, the more the compounding experiments stack
+  on a STALE baseline (6.172) instead of the best confirmed (6.1581). The search is
+  effectively running one champion-generation behind until a promotion. That's the
+  cost of the manual gate while I'm the only one awake — acceptable, but real.
+- *I keep choosing "surface it on the dashboard" as the fire.* Three fires of UI now.
+  Justified individually (each surfaced real new data), but the marginal value of
+  another panel is dropping. Next fire should bias to the RESEARCH (let confirmed
+  stacks run, analyze results) or a robustness fix, not more views.
+
+**Next moves (priority order)**
+1. **Watch the confirmed-stack results** — swiglu+canon_conv, swiglu+cross_block,
+   etc. are queued; do any compound PAST −0.0118? That's the live research question
+   and the real payoff, not another surface.
+2. **Bound infra retries** (attempts cap) — the one robustness gap still open.
+3. Dashboard layout (tabs/collapse) only if it gets unwieldy; psycopg_pool.
+
+---
+
 ## 2026-06-19 · findings.py — the research OUTPUT (what 58 mechanisms taught us)
 
 **Built the research conclusion view.** `loop_status` says if the loop runs;
