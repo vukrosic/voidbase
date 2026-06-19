@@ -7,6 +7,51 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Scaling direction de-risked + attempts cap ACTIVATED
+
+**Two things: scoped out the next big research direction, and activated a pending fix.**
+
+- **Scaling validation (does the tiny winner hold at 10M?) — feasible but needs a
+  clean scope.** The tiny1m3m search is near its ceiling (winners don't compound), so
+  the natural next question is whether SwiGLU's win survives at the next scale. Checked
+  `Screen10M20MConfig`: d_model 144, 24 layers, **20M tokens** (~7× tiny1m3m, so ~40
+  min/run). A 10M+swiglu config DRY-builds on the box — BUT the dry-run exposed a real
+  blocker: `run_experiment` merged the tiny1m3m champion.json fields (deepnet_alpha,
+  poly_alibi, muon_lr 0.048, alibi env) ONTO the 10M config. So a naive 10M run is
+  CONTAMINATED with tiny-scale tweaks — not a clean baseline. A faithful scaling test
+  needs a SEPARATE 10M scope with its own champion.json (or a `--no-base` path), plus
+  a GPU-allocation decision (one box can't run the tiny1m3m loop AND 10M runs). Logged
+  as the recommended next major direction, not launched (would yield contaminated
+  results). The de-risk check was worth it: feasible, but the pipeline is tiny1m3m-
+  shaped and a clean multi-scope setup is the real prerequisite.
+- **Activated the attempts cap** (committed last fire, was pending a restart):
+  restarted `worker.py` with the new code + `python -u` (unbuffered logs). Cost: one
+  re-runnable confirm seed (requeued cleanly). The infra-retry cap is now LIVE, and
+  worker logs flush immediately (no more buffered-log misdiagnoses). One worker, all
+  daemons healthy.
+
+**Self-critique**
+- *I keep eyeing the 10M pivot and backing off* — three mentions now. It's genuinely
+  the highest-value research direction, but it's blocked on a multi-scope refactor +
+  a GPU it'd have to take from the live loop. That's a real architectural project, not
+  a one-fire job; I should either commit to building multi-scope support across a few
+  fires, or explicitly leave it for the human. Naming it without doing it isn't
+  progress. Next substantive build should be multi-scope support IF I commit to the
+  scaling direction.
+- *The tiny1m3m search is in diminishing returns* — 14 untried singles left, but the
+  pattern (most are marginal/neutral) suggests few new winners. The honest call may be
+  to declare the tiny1m3m search DONE (3 confirmed winners found, documented in
+  findings) and move up in scale, rather than mine the last untried singles.
+
+**Next moves (priority order)**
+1. **Decision point: tiny1m3m search is near-complete.** Either (a) build multi-scope
+   support + validate SwiGLU at 10M (the real next research, multi-fire), or (b) keep
+   draining the tiny1m3m tail (diminishing). Leaning (a).
+2. **Recommend promotion** of SwiGLU (−0.0118) — the human's call, unblocks a clean
+   compounding/scaling baseline.
+
+---
+
 ## 2026-06-19 · 🔬 FINDING: the confirmed mechanisms do NOT compound (interference)
 
 **A real research conclusion, not a build.** Both two-mechanism stacks of the
