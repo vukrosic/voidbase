@@ -7,6 +7,50 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · feeder --seed-from confirmed (sharper stacking) + slowness diagnosed
+
+**Built the logged stack-quality fix and ruled out a feared bug.**
+
+- **`feeder --mode stack --seed-from confirmed`** (`ee145fa`): stack now optionally
+  seeds its C(winners,2) pairs ONLY from singles that passed a paired 3-seed confirm,
+  not from any single that screened below the champion once. The latter let
+  `gmlp_sgu` (screened in, paired-REJECTED) seed pairs — wasted GPU. Default stays
+  `beats` (back-compat). +3 unit tests (fake conn). Verified live: `beats` = 8 seeds
+  incl gmlp_sgu; `confirmed` = 1 (use_canon_conv) so it correctly REFUSES to stack
+  yet (need ≥2) — once SwiGLU's confirm lands there'll be 2 proven singles and it'll
+  pair canon_conv+swiglu, the highest-quality compounding experiment. 89 tests pass.
+- **Ruled out two scares:** SwiGLU's confirm looked "stuck at 2/6 for 3 fires" with
+  cand-s7 perpetually running — but the worker log shows ONE claim (no requeue loop),
+  the box is genuinely training it (GPU 99%, step 400), so it's just a slow single
+  run, not the infinite-infra-retry I logged as a risk. And `qk_layernorm`'s "failed
+  again" was the STALE old run-log (the SSH-drop one); its queue item is requeued at
+  pri 9, waiting behind the pri-100 confirm jobs — it hasn't actually re-run.
+- **GPU is NOT throttling** (67°C, 1935/2130 MHz, throttle-reasons 0x0). The ~7-8
+  min/run is inherent, not thermal — so throughput isn't a lever I can pull without
+  touching research code. Accepted.
+
+**Self-critique**
+- *`--seed-from confirmed` is built but I left the default `beats`* and the already-
+  queued stack pairs used `beats` (so a gmlp_sgu pair may be in flight). Switching the
+  default once a couple of confirms exist would be the real win; I made the tool but
+  didn't change behavior. Deliberate (back-compat + only 1 confirmed single today),
+  but it means the sharper mode won't bite until I explicitly use it next round.
+- *Three fires of "is the confirm stuck?" diagnosis* — I keep re-checking the same
+  slow-confirm and re-deriving "it's just slow." loop_status now shows confirm X/6;
+  I should TRUST it advances ~1 job/8min and stop re-investigating unless X/6 is
+  flat across two fires with the same running job-id (the actual stuck signature).
+- *No live exercise of confirmed-mode* — it correctly no-ops at 1 confirmed single, so
+  I couldn't see it pair for real yet. The unit test covers the ≥2 case; live proof
+  waits on SwiGLU's verdict.
+
+**Next moves (priority order)**
+1. **SwiGLU verdict** → then run `feeder --mode stack --seed-from confirmed` to pair
+   the 2 proven winners (canon_conv + swiglu) — the sharp compounding round.
+2. Let the already-queued beats-stack pairs + exploration drain.
+3. Bound infra retries (attempts cap); psycopg_pool.
+
+---
+
 ## 2026-06-19 · Stack-mode compounding search — combine the proven winners
 
 **Used the confirmed findings to DIRECT the next search round** — the compounding
