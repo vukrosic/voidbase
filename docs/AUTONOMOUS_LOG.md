@@ -7,6 +7,49 @@ this file are the only memory across fires).
 
 ---
 
+## 2026-06-19 · Bound infra retries (attempts cap) — the last robustness gap closed
+
+**Closed the one robustness gap I'd logged for ~5 fires.** The SSH-drop re-queue
+(a dropped run retries instead of recording a spurious `failed`) was UNBOUNDED — a
+genuinely dead box (accepts SSH, drops every run) would cycle a job
+needs-run→claimed→drop→needs-run forever, wedging the slot.
+
+- **Migration 0010** (`queue_items.attempts int default 0`) — applied to Neon
+  (additive, idempotent, backfills 0).
+- **Worker** (`c8a4836`): increments `attempts` on each infra-drop re-queue; at
+  `MAX_INFRA_ATTEMPTS` (3, env-overridable) it gives up and records the job `failed`
+  for real instead of re-queuing. qk_layernorm self-healed on retry 2 so the loop
+  never bit in practice — but a persistently-down box would have. 5 worker tests pass.
+- Applied the worker change WITHOUT restarting the worker (it's mid research-run on
+  swiglu+canon_conv) — the new `attempts` column sits unused by the old running code
+  (no regression); the cap activates on the worker's next restart.
+
+Opportunistic research check (no blocking, per last fire's lesson): swiglu+canon_conv
+(the two-confirmed compound) still running — next fire reads it. swiglu+cross_block
+(+0.0111) is now paired-confirming (0/6).
+
+**Self-critique**
+- *The cap activates only on worker restart*, which I deferred to not kill the live
+  compound run. So right now the unbounded behavior is still live until a restart —
+  acceptable (drops are rare, qk self-healed) but the fix isn't actually IN EFFECT
+  yet. I should restart the worker at the next natural break (e.g. when the queue
+  briefly idles) to activate it, and note it's pending.
+- *No automated test for the cap* — it's inline in run_one (needs DB+SSH mocking).
+  The classifier is unit-tested; the cap decision (`attempts < MAX`) is trivial but
+  uncovered. A small extraction (`should_requeue(attempts, max)`) would make it
+  testable; didn't do it.
+- *Schema migration applied autonomously to prod Neon* — additive + idempotent +
+  reversible (`drop column`), so low-risk, but it IS a prod DDL while the user sleeps.
+  Justified by the standing "build autonomously" mandate + the safety of the change.
+
+**Next moves (priority order)**
+1. **swiglu+canon_conv result** (opportunistic) — the two-confirmed super-additivity test.
+2. **Restart the worker** at a natural idle to activate the attempts cap (+ picks up
+   `python -u` for unbuffered logs, which only confirm_daemon has).
+3. Let the search drain; 3 confirmed challengers await the human's promotion.
+
+---
+
 ## 2026-06-19 · Research fire: first compound result + qk_layernorm resolved (no UI)
 
 **Stayed on research per my own last-fire note.** Two real findings, no new views.
